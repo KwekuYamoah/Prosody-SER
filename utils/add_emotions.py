@@ -1,6 +1,8 @@
 import pandas as pd
 from fuzzywuzzy import fuzz
 
+import re
+
 
 def load_and_prepare_data():
     """Read and prepare the data from CSV files."""
@@ -39,6 +41,21 @@ def load_and_prepare_data():
 
     return consolidated_df, emotions_df
 
+def time_to_milliseconds(time_str):
+
+    # expecting the format mm'm':ss's':ms'ms'
+    pattern = r'(\d+)m:(\d+)s:(\d+)ms'
+    match = re.match(pattern, time_str)
+    if match:
+        minutes = int(match.group(1))
+        seconds = int( match.group(2))
+        milliseconds = int(match.group(3))
+        total_milliseconds = (minutes * 60 + seconds) * 1000 + milliseconds
+
+        return total_milliseconds
+
+    else:
+        raise ValueError(f"Time string '{time_str}' does not match expected format.")
 
 def merge_data(consolidated_df, emotions_df):
     """Merge the emotions dataframe with the consolidated data using key columns: Movie ID, Movie Title, Dialogue ID, and Utterance ID."""
@@ -48,6 +65,10 @@ def merge_data(consolidated_df, emotions_df):
     # Check for duplicates in consolidated_subset on the merge keys
     merge_keys = ['Movie ID', 'Sentence No', 'Movie Title', 'Dialogue ID', 'Utterance ID']
     dup_rows = consolidated_subset[consolidated_subset.duplicated(subset=merge_keys, keep=False)]
+
+    # add start_milliseconds and end_milliseconds columns to emotions_df
+    emotions_df['start_milliseconds'] = emotions_df['Start Time'].apply(time_to_milliseconds)
+    emotions_df['end_milliseconds'] = emotions_df['End Time'].apply(time_to_milliseconds)
 
     # write duplicate rows to a CSV file for inspection
     dup_rows.to_csv("duplicate_rows.csv", index=False, encoding='utf-8')
@@ -77,6 +98,9 @@ def quality_check(merged_emotions_df):
     """Perform a quality check by counting matched and unmatched rows."""
     matched_rows = merged_emotions_df[merged_emotions_df['Consolidated'].notna()]
     unmatched_rows = merged_emotions_df[merged_emotions_df['Consolidated'].isna()]
+
+    # write unmatched rows to a CSV file for inspection
+    unmatched_rows.to_csv("unmatched_rows.csv", index=False, encoding='utf-8')
 
     total_rows = len(merged_emotions_df)
     num_matched = len(matched_rows)

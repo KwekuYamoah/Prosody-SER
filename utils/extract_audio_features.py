@@ -6,6 +6,7 @@ import librosa
 import json
 
 from pydub import AudioSegment
+from emotion_encoder import encode_emotion
 
 
 
@@ -34,20 +35,21 @@ def load_and_prepare_data():
 
     return consolidated_dict
 
-def slice_audio(audio_file, start_time, end_time, save_folder):
+def slice_audio(audio_file, start_time, end_time, save_folder, is_milliseconds=False):
     """
     Slice the audio file based on the given start and end times.
     Args:
         audio_file (str): Path to the input audio file (mp3 format)
-        start_time (float): Start time in seconds for the slice
-        end_time (float): End time in seconds for the slice
+        start_time (float): Start time in seconds or milliseconds
+        end_time (float): End time in seconds or milliseconds
         save_folder (str): Directory path where the sliced audio will be saved
+        is_milliseconds (bool): Whether the start_time and end_time are in milliseconds
     Returns:
         str: Path to the saved audio slice file
     Notes:
         - The output filename format is: {original_name}_{start_time}_{end_time}.mp3
         - Start time is clamped to minimum of 0 seconds
-        - Times are converted from seconds to milliseconds internally
+        - Times are converted to milliseconds internally if needed
         - Requires pydub.AudioSegment for processing
     
     """
@@ -59,9 +61,13 @@ def slice_audio(audio_file, start_time, end_time, save_folder):
     # Remove the file extension
     audio_name = os.path.splitext(audio_name)[0]
     
-    # Convert time from seconds to milliseconds for pydub
-    start_ms = max(0, start_time * 1000)
-    end_ms = end_time * 1000
+    # Convert time to milliseconds for pydub if needed
+    if is_milliseconds:
+        start_ms = max(0, start_time)
+        end_ms = end_time
+    else:
+        start_ms = max(0, start_time * 1000)
+        end_ms = end_time * 1000
     
     # Extract the slice of the audio corresponding to the word
     word_audio = audio[start_ms:end_ms]
@@ -72,7 +78,7 @@ def slice_audio(audio_file, start_time, end_time, save_folder):
     
     return temp_filename
 
-def extract_and_save_audio_features(data_dict, base_dir="audio/movie_audio_segments", output_file="data/ser_audio_features.json"):
+def extract_and_save_audio_features(data_dict, base_dir="audio/movie_audio_segments_mp3", output_file="data/ser_audio_features.json"):
     """
     Extracts audio features from the data dictionary and saves them to a JSON file incrementally.
     This function processes audio files one by one, loads them using librosa, and immediately
@@ -91,17 +97,25 @@ def extract_and_save_audio_features(data_dict, base_dir="audio/movie_audio_segme
     processed_count = 0
 
     audio_feature_dict = {}
+    # emotion list 
+    emotion_list = []
     # Process each item in the data dictionary
     for idx, item in enumerate(data_dict):
         try:
             # extract movie title, start time and end time from the dictionary
             movie_title = item.get('Movie Title')
-            start_time = int(item.get('start_seconds'))
-            end_time = int(item.get('end_seconds'))
+            start_time = int(item.get('start_milliseconds'))
+            end_time = int(item.get('end_milliseconds'))
             split = item.get('split')
+            emotion = item.get('Emotion')
+            encoded_emotion = encode_emotion(emotion)
+            # add the emotion to the list
+            emotion_list.append(emotion)
 
-            # add 5 second offset to end time
-            end_time += 5
+
+            # adjusting start and end times to expand context window
+            start_time = max(0, start_time - 10) # 10ms before the start time
+            end_time = end_time + 1500 # 25ms after the end time 
             
             # create intermediate string for path
             inter_path = f"{movie_title}_{start_time}_{end_time}.mp3"
@@ -118,9 +132,9 @@ def extract_and_save_audio_features(data_dict, base_dir="audio/movie_audio_segme
                     audio, sr = librosa.load(relative_path, sr=None, res_type='kaiser_fast')
                 else:
                     # If not found, try with adjusted end time
-                    end_time -= 5
-                    inter_path = f"{movie_title}_{start_time}_{end_time}.mp3"
-                    relative_path = os.path.join(base_dir, movie_title, inter_path)
+                    # end_time -= 5
+                    # inter_path = f"{movie_title}_{start_time}_{end_time}.mp3"
+                    # relative_path = os.path.join(base_dir, movie_title, inter_path)
                     
                     if os.path.exists(relative_path):
                         audio, sr = librosa.load(relative_path, sr=None, res_type='kaiser_fast')
@@ -131,13 +145,14 @@ def extract_and_save_audio_features(data_dict, base_dir="audio/movie_audio_segme
                         os.makedirs(save_folder, exist_ok=True)
 
                         # readjust the end time
-                        end_time += 5
+                        # end_time += 5
                         
                         filename = slice_audio(
                             audio_file=f"audio/full_movie_audios/{movie_title}.mp3",
                             start_time=start_time,
                             end_time=end_time,
-                            save_folder=save_folder
+                            save_folder=save_folder,
+                            is_milliseconds=True
                         )
                         
                         # Load the newly created file
@@ -189,6 +204,7 @@ def extract_and_save_audio_features(data_dict, base_dir="audio/movie_audio_segme
             feature_dict = {
                 'words': words,
                 'prosody_annotations': prosody_annotations,
+                'emotion': encoded_emotion,
                 'split': split
             }
             # Add the audio features to the dictionary
@@ -219,6 +235,8 @@ def extract_and_save_audio_features(data_dict, base_dir="audio/movie_audio_segme
         except Exception as e:
             print(f"Error processing item {idx}: {e}")
             continue
+
+    print(f"Unique emotions found: {set(emotion_list)}")
     
     print(f"Completed processing {processed_count} files.")
     # Save the audio features to the JSON file
