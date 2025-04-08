@@ -598,7 +598,7 @@ if __name__ == "__main__":
         json_path=json_path,
         xeus_checkpoint_path=xeus_checkpoint_path,
         epochs=1,               # for demonstration
-        batch_size=1,
+        batch_size=4,
         alpha_ctc=1.0,
         alpha_ser=1.0,
         alpha_prosody=1.0,
