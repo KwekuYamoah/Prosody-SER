@@ -35,7 +35,7 @@ def load_and_prepare_data():
 
     return consolidated_dict
 
-def slice_audio(audio_file, start_time, end_time, save_folder, is_milliseconds=False):
+def slice_audio(audio_file, start_time, end_time, save_folder, is_milliseconds=False, is_wav=False):
     """
     Slice the audio file based on the given start and end times.
     Args:
@@ -73,12 +73,16 @@ def slice_audio(audio_file, start_time, end_time, save_folder, is_milliseconds=F
     word_audio = audio[start_ms:end_ms]
     
     # Save to a temporary file
-    temp_filename = f"{save_folder}/{audio_name}_{start_time}_{end_time}.mp3"
-    word_audio.export(temp_filename, format="mp3")
+    if is_wav:
+        temp_filename = f"{save_folder}/{audio_name}_{start_time}_{end_time}.wav"
+        word_audio.export(temp_filename, format="wav")
+    else:
+        temp_filename = f"{save_folder}/{audio_name}_{start_time}_{end_time}.mp3"
+        word_audio.export(temp_filename, format="mp3")
     
     return temp_filename
 
-def extract_and_save_audio_features(data_dict, base_dir="audio/movie_audio_segments_mp3", output_file="data/ser_audio_features.json"):
+def extract_and_save_audio_features(data_dict, base_dir="audio/movie_audio_segments_wav", output_file="data/ser_audio_features_mp3.json"):
     """
     Extracts audio features from the data dictionary and saves them to a JSON file incrementally.
     This function processes audio files one by one, loads them using librosa, and immediately
@@ -152,7 +156,7 @@ def extract_and_save_audio_features(data_dict, base_dir="audio/movie_audio_segme
                             start_time=start_time,
                             end_time=end_time,
                             save_folder=save_folder,
-                            is_milliseconds=True
+                            is_milliseconds=True,
                         )
                         
                         # Load the newly created file
@@ -187,7 +191,7 @@ def extract_and_save_audio_features(data_dict, base_dir="audio/movie_audio_segme
                 words = [word.lower() for word in words]
                 
                 # extract second index of each tuple to a list to get the prosody
-                prosody_annotations = [annotation[1] for annotation in tokens]
+                prosody_annotations = [int(annotation[1]) for annotation in tokens]
                 
             # Convert NumPy array to list for JSON serialization
             audio_list = audio.tolist()
