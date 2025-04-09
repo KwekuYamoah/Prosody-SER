@@ -20,7 +20,7 @@ import os
 
 # ESPnet imports
 from espnet2.tasks.ssl import SSLTask
-
+from models import XeusMTL, MultiTaskLoss, Wav2Vec2MTL
 
 # set global device
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -107,10 +107,13 @@ class AkanSERDataset(Dataset):
     def __getitem__(self, idx):
         audio_path, meta = self.items[idx]
 
-        base_path = "../audio/"
+        base_path = "audio/"
 
         # Load audio (WAV) -> raw audio features
         samples, sr = sf.read(base_path + audio_path)
+        if len(samples) < 2:
+            # Raise an explicit error
+            raise ValueError(f"Audio {audio_path} is too short (length {len(samples)}).")
 
         # words for ASR head + convert words -> token IDs
         words = meta["words"]
@@ -235,7 +238,7 @@ def train_model(json_path, xeus_checkpoint_path, epochs=2, batch_size=2,
                 audio_features, 
                 lengths, 
                 use_mask=True,
-                prosody_target_len=prosody_labels.size(1)  # Use actual prosody sequence length
+                prosody_target_len=prosody_labels.size(1) # use length of prosody labels
             )
 
             # For CTC, the "input lengths" (time dimension) = asr_logits.size(0), 
@@ -287,7 +290,7 @@ def train_model(json_path, xeus_checkpoint_path, epochs=2, batch_size=2,
                         audio_features, 
                         lengths, 
                         use_mask=False,
-                        prosody_target_len=prosody_labels.size(1)
+                        prosody_target_len=prosody_labels.size(1) # use length of prosody labels
                     )
                     
                     if asr_logits is not None:
@@ -361,8 +364,8 @@ def predict_emotions(model, audio_files):
 
 if __name__ == "__main__":
     # Suppose you have a local JSON with data
-    json_path = "../data/ser_audio_features_wav.json"
-    xeus_checkpoint_path = "../XEUS/model/xeus_checkpoint.pth"
+    json_path = "data/ser_audio_features_wav.json"
+    xeus_checkpoint_path = "XEUS/model/xeus_checkpoint.pth"
 
     # set seed
     seed = 42
