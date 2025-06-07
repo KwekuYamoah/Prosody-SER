@@ -24,7 +24,7 @@ from espnet2.tasks.ssl import SSLTask
 # set global device
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-
+print(f"Using device: {device}")
 
 # 2. Multi-Task Model: Shared Xeus backbone + Task-specific heads
 class XeusMTL(nn.Module):

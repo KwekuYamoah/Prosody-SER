@@ -25,6 +25,9 @@ from models import XeusMTL, MultiTaskLoss, Wav2Vec2MTL
 # set global device
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+
+print(f"Using device: {device}")
+
 def build_word_dict(json_path):
     """
     Go through the entire JSON dataset, gather all distinct words, 
