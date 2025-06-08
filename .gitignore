@@ -189,7 +189,6 @@ data_files/*
 
 audio/*
 excel_files/*
-sample_code/*
 ser39/*
 
 XEUS/*
