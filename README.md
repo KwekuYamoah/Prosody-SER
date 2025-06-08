@@ -1,216 +1,239 @@
-# Multi-Task Learning Framework for Speech Processing
+# Prosody-SER: Multi-Task Learning for Speech Emotion Recognition
 
-A flexible multi-task learning framework for speech processing tasks including ASR, prosodic prominence detection, and speech emotion recognition.
+This repository contains a Multi-Task Learning (MTL) system for Speech Emotion Recognition (SER) that combines Automatic Speech Recognition (ASR), Prosody Analysis, and Emotion Recognition tasks.
 
 ## Features
 
-- **Multiple Backbone Support**: Easily switch between different backbone models (Whisper, XLSR, MMS, Wav2Vec2-BERT)
-- **Task-Specific Heads**: Configurable heads for ASR, prosody, and emotion recognition
-- **Dynamic Tokenizer**: SentencePiece tokenizer for improved ASR performance
-- **Comprehensive Monitoring**: Training metrics, validation metrics, and visualization tools
-- **Flexible Configuration**: Easy-to-use configuration system for model parameters
+- Multi-task learning architecture with configurable backbone models
+- Support for multiple backbone models:
+  - Whisper
+  - XLSR
+  - MMS
+  - Wav2Vec2-BERT
+- SentencePiece tokenizer with CTC support
+- Comprehensive training pipeline with:
+  - Early stopping
+  - Model checkpointing
+  - Metrics tracking
+  - Wandb integration
+  - Training history visualization
 
-## Supported Backbone Models
-- Whisper (large-v3)
-- XLSR (wav2vec2-large-xlsr-53)
-- MMS (mms-1b-all)
-- Wav2Vec2-BERT (w2v-bert-2.0)
-
-## Requirements
-
-### Core Dependencies
-- torch>=2.0.0
-- transformers>=4.30.0
-- sentencepiece>=0.1.99
-- numpy>=1.24.0
-- scikit-learn>=1.0.0
-- jiwer>=3.0.0
-
-### Optional Dependencies
-- matplotlib>=3.7.0 (for visualization)
-- wandb>=0.15.0 (for experiment tracking)
-- tqdm>=4.65.0 (for progress bars)
-
-## Project Structure
-
-```
-.
-├── sample_code/
-│   ├── backbone_models.py    # Backbone model implementations
-│   ├── mtl_config.py         # Configuration management
-│   ├── mtl_model.py          # MTL model implementation
-│   ├── mtl_dataset.py        # Dataset handling
-│   ├── tokenizer.py          # SentencePiece tokenizer
-│   └── train_mtl.py          # Training script
-├── checkpoints/              # Model checkpoints
-├── requirements.txt          # Project dependencies
-└── README.md                 # This file
-```
-
-## Quick Start
-
-### Google Colab Setup
+## Installation
 
 1. Clone the repository:
-```bash
-!git clone https://github.com/yourusername/Prosody-SER.git
-%cd Prosody-SER
-```
 
-2. Install dependencies:
-```bash
-!pip install -r requirements.txt
-```
-
-3. Set up GPU:
-```python
-import torch
-assert torch.cuda.is_available(), "GPU not available"
-```
-
-4. Load your dataset and create the MTL system:
-```python
-from sample_code.train_mtl import create_mtl_system
-
-# Create MTL system with new tokenizer
-model, train_loader, val_loader, test_loader, tokenizer = create_mtl_system(
-    dataset_dict=your_dataset,
-    backbone_name="whisper",
-    vocab_size=4000,
-    batch_size=8,
-    retrain_tokenizer=True  # Set to False to use existing tokenizer
-)
-
-# Or load existing tokenizer
-model, train_loader, val_loader, test_loader, tokenizer = create_mtl_system(
-    dataset_dict=your_dataset,
-    backbone_name="whisper",
-    vocab_size=4000,
-    batch_size=8,
-    tokenizer_path="path/to/tokenizer.model"
-)
-```
-
-### HPC Setup
-
-1. Clone and install:
 ```bash
 git clone https://github.com/yourusername/Prosody-SER.git
 cd Prosody-SER
-pip install -r requirements.txt
 ```
 
-2. Run training:
+2. Install required dependencies:
+
+```bash
+pip install torch transformers sentencepiece matplotlib tqdm numpy scikit-learn wandb jiwer datasets
+```
+
+## Dataset Structure
+
+The system expects your dataset to be organized in the following format:
+
+1. Audio files in a base directory
+2. JSONL files for train/val/test splits with the following structure:
+
+```json
+{
+    "audio_filepath": "relative/path/to/audio/file.wav",
+    "words": ["word1", "word2", "word3"],
+    "prosody_annotations": [0, 1, 0],
+    "emotion": 3
+}
+```
+
+## Usage
+
+### Training
+
+The training script supports various command-line arguments for customization:
+
 ```bash
 python sample_code/train_mtl.py \
+    --audio_base_path "/path/to/audio/files/" \
+    --train_jsonl "/path/to/train.jsonl" \
+    --val_jsonl "/path/to/val.jsonl" \
+    --test_jsonl "/path/to/test.jsonl" \
     --backbone whisper \
     --batch_size 8 \
     --vocab_size 4000 \
     --num_epochs 10 \
-    --retrain_tokenizer  # Remove this flag to use existing tokenizer
+    --lr 1e-4 \
+    --save_dir "checkpoints" \
+    --use_wandb
 ```
 
-## Training Options
+#### Command-line Arguments
 
-### Command Line Arguments
-- `--backbone`: Backbone model to use (whisper, xlsr, mms, wav2vec2-bert)
-- `--batch_size`: Batch size for training
-- `--vocab_size`: Vocabulary size for SentencePiece tokenizer
-- `--num_epochs`: Number of training epochs
-- `--lr`: Learning rate
-- `--save_dir`: Directory to save checkpoints
-- `--use_wandb`: Enable Weights & Biases tracking
-- `--retrain_tokenizer`: Train new SentencePiece tokenizer
-- `--tokenizer_path`: Path to existing tokenizer model
+- `--audio_base_path`: Base directory containing audio files (required)
+- `--train_jsonl`: Path to training JSONL file (required)
+- `--val_jsonl`: Path to validation JSONL file (required)
+- `--test_jsonl`: Path to test JSONL file (required)
+- `--backbone`: Backbone model to use (default: "whisper")
+  - Options: "whisper", "xlsr", "mms", "wav2vec2-bert"
+- `--batch_size`: Batch size for training (default: 8)
+- `--vocab_size`: Vocabulary size for tokenizer (default: 4000)
+- `--num_epochs`: Number of training epochs (default: 10)
+- `--lr`: Learning rate (default: 1e-4)
+- `--save_dir`: Directory to save checkpoints (default: "checkpoints")
+- `--use_wandb`: Enable Wandb logging (optional flag)
 
-### Configuration Options
-- `vocab_size`: Size of vocabulary (default: 4000)
-- `emotion_classes`: Number of emotion classes (default: 9)
-- `prosody_classes`: Number of prosody classes (default: 2)
-- `freeze_encoder`: Whether to freeze backbone encoder (default: True)
-- `loss_weights`: Weights for different task losses
+### Example Usage
+
+#### Google Colab
+
+```bash
+python sample_code/train_mtl.py \
+    --audio_base_path "/content/drive/MyDrive/AKAN-SPEECH-EMOTION-DATA/AUDIO/" \
+    --train_jsonl "/content/drive/MyDrive/AKAN-SPEECH-EMOTION-DATA/AUDIO/ser_audio_features_wav_train.jsonl" \
+    --val_jsonl "/content/drive/MyDrive/AKAN-SPEECH-EMOTION-DATA/AUDIO/ser_audio_features_wav_val.jsonl" \
+    --test_jsonl "/content/drive/MyDrive/AKAN-SPEECH-EMOTION-DATA/AUDIO/ser_audio_features_wav_test.jsonl" \
+    --backbone whisper \
+    --batch_size 8 \
+    --num_epochs 10
+```
+
+#### HPC or Local Machine
+
+```bash
+python sample_code/train_mtl.py \
+    --audio_base_path "/path/to/your/audio/files/" \
+    --train_jsonl "/path/to/train.jsonl" \
+    --val_jsonl "/path/to/val.jsonl" \
+    --test_jsonl "/path/to/test.jsonl" \
+    --backbone whisper \
+    --batch_size 8 \
+    --num_epochs 10
+```
+
+## Output
+
+The training process will:
+
+1. Save model checkpoints in the specified `save_dir`
+2. Generate training history plots
+3. Save test results in JSON format
+4. Log metrics to Wandb if enabled
+
+## Model Architecture
+
+The system uses a multi-task learning approach with:
+
+- A shared backbone for feature extraction
+- Task-specific heads for:
+  - ASR (Automatic Speech Recognition)
+  - Prosody Analysis
+  - Emotion Recognition
 
 ## Tokenizer Management
 
-The framework uses SentencePiece for subword tokenization, which provides several benefits:
+The system uses SentencePiece for subword tokenization, which provides several benefits:
+
 - Better handling of out-of-vocabulary words
 - Consistent vocabulary size
 - Improved handling of morphological variations
 
-### Training New Tokenizer
+### Initial Tokenizer Training
+
+Before training the MTL model, you need to train the SentencePiece tokenizer:
+
 ```python
 from sample_code.train_mtl import setup_tokenizer_and_dataset
 
+# Train new tokenizer
 tokenizer = setup_tokenizer_and_dataset(
     dataset_dict=your_dataset,
-    vocab_size=4000,
+    vocab_size=4000,  # Adjust based on your needs
     model_prefix='whisper_mtl_tokenizer'
 )
 ```
 
-### Loading Existing Tokenizer
+This will:
+
+1. Extract all text from your dataset
+2. Train a new SentencePiece model
+3. Save the model and vocabulary files
+
+### Using Existing Tokenizer
+
+For subsequent training runs, you can use an existing tokenizer:
+
 ```python
 from sample_code.tokenizer import SentencePieceTokenizer
 
-tokenizer = SentencePieceTokenizer(model_path='path/to/tokenizer.model')
+# Load existing tokenizer
+tokenizer = SentencePieceTokenizer(
+    model_path='path/to/tokenizer.model',
+    vocab_size=4000  # Should match the trained tokenizer
+)
 tokenizer.load_tokenizer()
 ```
 
-## Monitoring and Visualization
+### Tokenizer Configuration
 
-### Weights & Biases
-Enable W&B tracking with the `--use_wandb` flag to monitor:
-- Training and validation losses
-- Task-specific metrics
-- Model parameters and gradients
+The SentencePiece tokenizer includes special tokens:
 
-### Training History
-The framework automatically saves:
-- Training history plots
-- Model checkpoints
-- Tokenizer model and vocabulary
+- `pad_id`: 0 (Padding token)
+- `unk_id`: 1 (Unknown token)
+- `blank_id`: 2 (CTC blank token)
+- `bos_id`: 3 (Beginning of sequence)
+- `eos_id`: 4 (End of sequence)
 
-## Model Checkpoints
+### Tokenizer Usage in Training
 
-Checkpoints are saved in the following format:
+When running the training script, you can specify whether to use an existing tokenizer:
+
+```bash
+# First time training (train new tokenizer)
+python sample_code/train_mtl.py \
+    --audio_base_path "/path/to/audio/files/" \
+    --train_jsonl "/path/to/train.jsonl" \
+    --val_jsonl "/path/to/val.jsonl" \
+    --test_jsonl "/path/to/test.jsonl" \
+    --backbone whisper \
+    --vocab_size 4000 \
+    --retrain_tokenizer  # This flag will train a new tokenizer
+
+# Subsequent training (use existing tokenizer)
+python sample_code/train_mtl.py \
+    --audio_base_path "/path/to/audio/files/" \
+    --train_jsonl "/path/to/train.jsonl" \
+    --val_jsonl "/path/to/val.jsonl" \
+    --test_jsonl "/path/to/test.jsonl" \
+    --backbone whisper \
+    --vocab_size 4000 \
+    --tokenizer_path "path/to/tokenizer.model"  # Use existing tokenizer
 ```
-checkpoints/
-├── best_model.pt           # Best model based on validation loss
-├── checkpoint_epoch_X.pt   # Checkpoint for epoch X
-├── final_model.pt          # Final model after training
-└── training_history.json   # Training metrics history
-```
 
-## Best Practices
+### Tokenizer Best Practices
 
-### Initial Testing
-1. Start with a small dataset subset
-2. Use a smaller vocabulary size (e.g., 1000)
-3. Enable all monitoring tools
-4. Use a smaller batch size
+1. **Vocabulary Size**:
 
-### Full Training
-1. Use the complete dataset
-2. Set appropriate vocabulary size
-3. Enable early stopping
-4. Use gradient accumulation for larger batches
+   - Start with a smaller vocabulary (e.g., 1000-2000) for initial testing
+   - Increase to 4000-8000 for production use
+   - Consider your language's characteristics when choosing size
+2. **Training Data**:
 
-### Memory Management
-- Monitor GPU memory usage
-- Use gradient accumulation for larger batches
-- Clear cache between training runs
+   - Use a representative sample of your dataset
+   - Include all possible word forms
+   - Consider adding domain-specific terms
+3. **Model Type**:
 
-## Troubleshooting
+   - Uses BPE (Byte Pair Encoding) by default
+   - Character coverage set to 0.995
+   - No normalization applied (identity rule)
+4. **Special Tokens**:
 
-### Common Issues
-1. **Out of Memory**: Reduce batch size or use gradient accumulation
-2. **Tokenizer Errors**: Ensure text data is properly preprocessed
-3. **Training Instability**: Adjust learning rate or loss weights
-
-### Performance Optimization
-1. Use mixed precision training
-2. Enable gradient accumulation
-3. Optimize data loading with num_workers
+   - The system automatically handles special tokens
+   - CTC blank token is essential for ASR
+   - BOS/EOS tokens help with sequence modeling
 
 ## Contributing
 
@@ -218,4 +241,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details. 
+[Add your license information here]
