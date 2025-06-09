@@ -422,7 +422,6 @@ class MTLEvaluator:
                 print(f"Target Emotion: {result['target']}")
                 print(f"Predicted Emotion: {result['predicted']}")
 
-
 class MTLTrainer:
     """Enhanced trainer class with monitoring and visualization"""
 
