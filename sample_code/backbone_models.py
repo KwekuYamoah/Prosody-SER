@@ -9,8 +9,10 @@ from typing import Dict, Optional, Union
 import torch
 import torch.nn as nn
 
+
 class BackboneConfig:
     """Configuration class for backbone models"""
+
     def __init__(
         self,
         model_name: str,
@@ -24,6 +26,7 @@ class BackboneConfig:
         self.hidden_size = hidden_size
         self.freeze_encoder = freeze_encoder
         self.kwargs = kwargs
+
 
 # Define available backbone configurations
 BACKBONE_CONFIGS = {
@@ -49,20 +52,22 @@ BACKBONE_CONFIGS = {
     ),
 }
 
+
 class BackboneModel(nn.Module):
     """Wrapper class for different backbone models"""
+
     def __init__(self, config: BackboneConfig):
         super().__init__()
         self.config = config
         self.model = self._load_model()
         self.feature_extractor = self._load_feature_extractor()
-        
+
         if config.freeze_encoder:
             self._freeze_encoder()
-    
+
     def get_hidden_size(self) -> int:
-      """Get the hidden size of the backbone model"""
-      return self.config.hidden_size
+        """Get the hidden size of the backbone model"""
+        return self.config.hidden_size
 
     def _load_model(self) -> nn.Module:
         """Load the appropriate model based on configuration"""
@@ -75,7 +80,8 @@ class BackboneModel(nn.Module):
         elif self.config.model_name == "wav2vec2-bert":
             return Wav2Vec2BertModel.from_pretrained(self.config.pretrained_model_name)
         else:
-            raise ValueError(f"Unsupported model name: {self.config.model_name}")
+            raise ValueError(
+                f"Unsupported model name: {self.config.model_name}")
 
     def _load_feature_extractor(self):
         """Load the appropriate feature extractor"""
@@ -95,7 +101,8 @@ class BackboneModel(nn.Module):
             outputs = self.model(input_features)
             return outputs.last_hidden_state
         else:
-            raise ValueError(f"Unsupported model name: {self.config.model_name}")
+            raise ValueError(
+                f"Unsupported model name: {self.config.model_name}")
 
     def extract_features(self, audio_array: torch.Tensor, sampling_rate: int = 16000) -> torch.Tensor:
         """Extract features from audio using the feature extractor"""
@@ -104,4 +111,11 @@ class BackboneModel(nn.Module):
             sampling_rate=sampling_rate,
             return_tensors="pt"
         )
-        return features.input_features.squeeze(0) 
+
+        if self.config.model_name == "whisper":
+            return features.input_features.squeeze(0)
+        elif self.config.model_name in ["xlsr", "mms", "wav2vec2-bert"]:
+            return features.input_values.squeeze(0)
+        else:
+            raise ValueError(
+                f"Unsupported model name: {self.config.model_name}")
