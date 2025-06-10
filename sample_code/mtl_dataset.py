@@ -78,17 +78,24 @@ class MTLDataset(Dataset):
 
         # Extract features - DO NOT return tensors yet
         with torch.no_grad():
-            if self.backbone_name == "whisper":
-                # Whisper feature extractor returns log-mel spectrograms
+            if self.backbone_name in ["whisper", "wav2vec2-bert"]:
+                # Whisper, Wave2Vec-Bert feature extractor returns log-mel spectrograms
                 features = self.feature_extractor(
                     audio_array,
                     sampling_rate=self.sampling_rate,
                     return_tensors="pt"
                 )
-                # Shape: (1, n_mels, time) -> (n_mels, time)
-                input_features = features.input_features.squeeze(0)
+                if self.backbone_name == "wav2vec2-bert":
+                    input_features = features.input_features.squeeze(0)
 
-            elif self.backbone_name in ["xlsr", "mms", "wav2vec2-bert"]:
+                    # Double-check it's 1D
+                    if input_features.ndim != 1:
+                        input_features = input_features.squeeze()
+                else:
+                    # Shape: (1, n_mels, time) -> (n_mels, time)
+                    input_features = features.input_features.squeeze(0)
+
+            elif self.backbone_name in ["xlsr", "mms"]:
                 # Wav2Vec2 feature extractor returns normalized waveforms
                 # IMPORTANT: Do not return tensors here, process raw audio
                 features = self.feature_extractor(

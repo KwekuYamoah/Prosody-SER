@@ -633,49 +633,127 @@ def setup_tokenizer_and_dataset(dataset_dict, vocab_size=4000, model_prefix='aka
     return tokenizer
 
 
+# def collate_fn_mtl(batch: List[Dict], pad_token_id: int = 0, tokenizer=None, backbone_name: str = "whisper") -> Dict:
+#     """
+#     Custom collate function for MTL.
+#     CRITICAL FIX: Properly handle different backbone input shapes.
+#     """
+#     batch_size = len(batch)
+
+#     # Handle input features based on backbone type
+#     if backbone_name in ["whisper", "wav2vec2-bert"]:
+#         # Whisper: input shape is (n_mels, time) for each sample
+#         # Find max time dimension
+#         max_time = max(item['input_features'].shape[1] for item in batch)
+#         n_mels = batch[0]['input_features'].shape[0]
+
+#         # Create padded tensor: (batch, n_mels, time)
+#         input_features = torch.zeros(batch_size, n_mels, max_time)
+
+#         for i, item in enumerate(batch):
+#             time_len = item['input_features'].shape[1]
+#             input_features[i, :, :time_len] = item['input_features']
+
+#     elif backbone_name in ["xlsr", "mms"]:
+#         # Wav2Vec2: input shape is (time,) for each sample - 1D audio
+#         # Find max length
+#         max_len = max(item['input_features'].shape[0] for item in batch)
+
+#         # Create padded tensor: (batch, time)
+#         input_features = torch.zeros(batch_size, max_len)
+
+#         for i, item in enumerate(batch):
+#             feat = item['input_features']
+#             # Ensure it's 1D
+#             if feat.ndim > 1:
+#                 feat = feat.flatten()
+#             length = feat.shape[0]
+#             input_features[i, :length] = feat
+#     else:
+#         raise ValueError(f"Unknown backbone: {backbone_name}")
+
+#     # Pad prosody targets
+#     max_prosody_len = max(item['prosody_targets'].shape[0] for item in batch)
+#     prosody_targets = torch.zeros(batch_size, max_prosody_len)
+
+#     for i, item in enumerate(batch):
+#         prosody_len = item['prosody_targets'].shape[0]
+#         prosody_targets[i, :prosody_len] = item['prosody_targets']
+
+#     # Stack emotion targets
+#     emotion_targets = torch.tensor(
+#         [item['emotion_targets'] for item in batch], dtype=torch.long
+#     )
+
+#     # Collect words
+#     words_batch = [item['words'] for item in batch]
+
+#     # Tokenize and pad ASR targets
+#     if tokenizer:
+#         tokenized_ids = []
+#         for item in batch:
+#             text_to_encode = " ".join(item['asr_target'])
+#             ids = tokenizer.encode(text_to_encode, add_special_tokens=True)
+#             tokenized_ids.append(torch.tensor(ids, dtype=torch.long))
+
+#         # Pad sequences
+#         asr_targets = torch.nn.utils.rnn.pad_sequence(
+#             tokenized_ids, batch_first=True, padding_value=pad_token_id
+#         )
+#         asr_lengths = torch.tensor([len(ids)
+#                                    for ids in tokenized_ids], dtype=torch.long)
+#     else:
+#         asr_targets, asr_lengths = None, None
+
+#     return {
+#         'input_features': input_features,
+#         'words': words_batch,
+#         'asr_targets': asr_targets,
+#         'asr_lengths': asr_lengths,
+#         'prosody_targets': prosody_targets,
+#         'emotion_targets': emotion_targets
+#     }
+
 def collate_fn_mtl(batch: List[Dict], pad_token_id: int = 0, tokenizer=None, backbone_name: str = "whisper") -> Dict:
     """
     Custom collate function for MTL.
-    CRITICAL FIX: Properly handle different backbone input shapes.
+    CRITICAL FIX: Properly handle different backbone input shapes by finding
+    the max size of all dimensions in the batch.
     """
     batch_size = len(batch)
 
     # Handle input features based on backbone type
-    if backbone_name == "whisper":
-        # Whisper: input shape is (n_mels, time) for each sample
-        # Find max time dimension
+    if backbone_name in ["whisper", "wav2vec2-bert"]:
+        # --- FIX STARTS HERE ---
+        # Find the max dimensions for both frequency and time across the entire batch.
+        max_n_mels = max(item['input_features'].shape[0] for item in batch)
         max_time = max(item['input_features'].shape[1] for item in batch)
-        n_mels = batch[0]['input_features'].shape[0]
 
-        # Create padded tensor: (batch, n_mels, time)
-        input_features = torch.zeros(batch_size, n_mels, max_time)
+        # Create a padded tensor using the maximum dimensions found.
+        input_features = torch.zeros(batch_size, max_n_mels, max_time)
 
+        # Copy each item into the correctly-sized padded tensor.
         for i, item in enumerate(batch):
-            time_len = item['input_features'].shape[1]
-            input_features[i, :, :time_len] = item['input_features']
+            n_mels, time_len = item['input_features'].shape
+            input_features[i, :n_mels, :time_len] = item['input_features']
+        # --- FIX ENDS HERE ---
 
-    elif backbone_name in ["xlsr", "mms", "wav2vec2-bert"]:
-        # Wav2Vec2: input shape is (time,) for each sample - 1D audio
-        # Find max length
+    elif backbone_name in ["xlsr", "mms"]:
+        # This part for 1D audio is likely correct but kept for completeness.
         max_len = max(item['input_features'].shape[0] for item in batch)
-
-        # Create padded tensor: (batch, time)
         input_features = torch.zeros(batch_size, max_len)
-
         for i, item in enumerate(batch):
-            feat = item['input_features']
-            # Ensure it's 1D
-            if feat.ndim > 1:
-                feat = feat.flatten()
+            feat = item['input_features'].flatten()
             length = feat.shape[0]
             input_features[i, :length] = feat
     else:
         raise ValueError(f"Unknown backbone: {backbone_name}")
 
+    # --- The rest of the function remains the same ---
+
     # Pad prosody targets
     max_prosody_len = max(item['prosody_targets'].shape[0] for item in batch)
     prosody_targets = torch.zeros(batch_size, max_prosody_len)
-
     for i, item in enumerate(batch):
         prosody_len = item['prosody_targets'].shape[0]
         prosody_targets[i, :prosody_len] = item['prosody_targets']
@@ -690,13 +768,11 @@ def collate_fn_mtl(batch: List[Dict], pad_token_id: int = 0, tokenizer=None, bac
 
     # Tokenize and pad ASR targets
     if tokenizer:
-        tokenized_ids = []
-        for item in batch:
-            text_to_encode = " ".join(item['asr_target'])
-            ids = tokenizer.encode(text_to_encode, add_special_tokens=True)
-            tokenized_ids.append(torch.tensor(ids, dtype=torch.long))
-
-        # Pad sequences
+        tokenized_ids = [
+            torch.tensor(tokenizer.encode(
+                " ".join(item['asr_target']), add_special_tokens=True), dtype=torch.long)
+            for item in batch
+        ]
         asr_targets = torch.nn.utils.rnn.pad_sequence(
             tokenized_ids, batch_first=True, padding_value=pad_token_id
         )
@@ -848,9 +924,9 @@ if __name__ == "__main__":
         emotion_classes=9,
         prosody_classes=2,
         loss_weights={
-            'asr': 0.0,
-            'prosody': 1.0,
-            'ser': 1.0
+            'asr': 1.0,
+            'prosody': 0.5,
+            'ser': 0.5
         },
 
     )
@@ -858,7 +934,7 @@ if __name__ == "__main__":
     # Create model
     model = MTLModel(
         config=config,
-        use_asr=False,
+        use_asr=True,
         use_prosody=True,
         use_ser=True,
         tokenizer=tokenizer

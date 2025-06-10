@@ -77,7 +77,7 @@ def test_single_sample(audio_base_path, train_jsonl, backbone_name="xlsr"):
         print(f"✓ Backbone output shape: {output.shape}")
 
     # Expected shapes:
-    if backbone_name == "whisper":
+    if backbone_name in ["whisper", "wav2vec2-bert"]:
         assert input_features.ndim == 3  # (batch, n_mels, time)
     else:
         assert input_features.ndim == 2  # (batch, time)

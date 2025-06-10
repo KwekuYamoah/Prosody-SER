@@ -137,9 +137,9 @@ class BackboneModel(nn.Module):
             return_tensors="pt"
         )
 
-        if self.config.model_name == "whisper":
+        if self.config.model_name in ["whisper", "wav2vec2-bert"]:
             return features.input_features.squeeze(0)
-        elif self.config.model_name in ["xlsr", "mms", "wav2vec2-bert"]:
+        elif self.config.model_name in ["xlsr", "mms"]:
             return features.input_values.squeeze(0)
         else:
             raise ValueError(
