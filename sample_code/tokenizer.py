@@ -47,11 +47,11 @@ class SentencePieceTokenizer:
         else:
             raise FileNotFoundError(f"SentencePiece model not found at {self.model_path}")
 
-    def encode_words(self, words_list: List[str], add_special_tokens: bool = False) -> List[int]:
+    def encode(self, word_str: str, add_special_tokens: bool = False) -> List[int]:
         """
         Encode list of words to token IDs
         Args:
-            words_list: List of word strings
+            words_str: sentence for ASR
             add_special_tokens: Whether to add BOS/EOS tokens
         Returns:
             List of token IDs
@@ -59,9 +59,9 @@ class SentencePieceTokenizer:
         if not self.sp:
             raise RuntimeError("Tokenizer not loaded. Call load_tokenizer() first.")
 
-        # join words with spaces and encode
-        text = ' '.join(words_list)
-        token_ids = self.sp.encode_as_ids(text)
+        # encode
+        
+        token_ids = self.sp.encode_as_ids(word_str)
 
         if add_special_tokens:
             token_ids = [self.bos_id] + token_ids + [self.eos_id]
