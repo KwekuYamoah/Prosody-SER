@@ -120,7 +120,7 @@ class MTLEvaluator:
                 emotion_targets = batch["emotion_targets"].to(
                     self.device, non_blocking=True)
 
-                with autocast(enabled=self.use_amp):
+                with torch.amp.autocast(device_type="cuda", enabled=self.use_amp):
                     outputs = self.model(
                         input_features=input_features,
                         asr_targets=asr_targets,
@@ -223,7 +223,7 @@ class MTLTrainer:
         self.use_wandb = use_wandb
         self.use_amp = use_amp
         self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.scaler = GradScaler(enabled=use_amp)
+        self.scaler = torch.amp.GradScaler(enabled=use_amp)
         self.history = {
             'train_loss': [], 'val_loss': [],
             'train_metrics': [], 'val_metrics': []
@@ -242,7 +242,7 @@ class MTLTrainer:
         emotion_targets = batch['emotion_targets'].to(self.device)
 
         if self.use_amp:
-            with autocast():
+            with torch.amp.autocast(device_type="cuda", enabled=self.use_amp):
                 outputs = self.model(
                     input_features=input_features,
                     asr_targets=asr_targets,
@@ -353,7 +353,7 @@ class MTLTrainer:
                 emotion_targets = batch['emotion_targets'].to(self.device)
 
                 if self.use_amp:
-                    with autocast():
+                    with torch.amp.autocast(device_type="cuda", enabled=self.use_amp):
                         outputs = self.model(
                             input_features=input_features,
                             asr_targets=asr_targets,

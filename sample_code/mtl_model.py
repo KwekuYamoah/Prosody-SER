@@ -94,6 +94,58 @@ class MTLModel(nn.Module):
         if self.use_ser:
             self.ser_loss = nn.CrossEntropyLoss()
 
+    def _adaptive_pool_workaround(self, features: torch.Tensor, target_length: int) -> torch.Tensor:
+        """
+        Workaround for adaptive pooling CUDA error.
+        Uses fixed-size average pooling instead of adaptive pooling.
+        """
+        B, T, D = features.shape
+
+        if T == target_length:
+            return features
+
+        # Transpose for pooling: (B, D, T)
+        features_t = features.transpose(1, 2)
+
+        if T < target_length:
+            # Upsample if needed
+            pooled = F.interpolate(
+                features_t,
+                size=target_length,
+                mode='linear',
+                align_corners=False
+            )
+        else:
+            # Use fixed avg_pool1d instead of adaptive
+            # Calculate kernel size and stride for desired output length
+            kernel_size = T // target_length
+            stride = kernel_size
+
+            # Handle edge cases where division isn't perfect
+            padding = 0
+            expected_out = (T - kernel_size + 2 * padding) // stride + 1
+
+            if expected_out < target_length:
+                # Need to adjust kernel or stride
+                kernel_size = max(1, kernel_size - 1)
+                stride = kernel_size
+
+            # Apply average pooling
+            pooled = F.avg_pool1d(
+                features_t, kernel_size=kernel_size, stride=stride)
+
+            # If we still don't have exact target length, interpolate
+            if pooled.size(2) != target_length:
+                pooled = F.interpolate(
+                    pooled,
+                    size=target_length,
+                    mode='linear',
+                    align_corners=False
+                )
+
+        # Transpose back: (B, T, D)
+        return pooled.transpose(1, 2)
+
     def forward(
         self,
         input_features: torch.Tensor,
@@ -124,21 +176,24 @@ class MTLModel(nn.Module):
                 outputs['asr_loss'] = asr_loss
                 total_loss += self.config.loss_weights['asr'] * asr_loss
 
-        # Prosody forward pass
+        # Prosody forward pass with CUDA fix
         if self.use_prosody and self.prosody_head is not None:
-            prosody_target_len = prosody_targets.shape[1] if prosody_targets is not None else None
-
             B, T, D = backbone_features.shape
+            prosody_target_len = prosody_targets.shape[1] if prosody_targets is not None else 0
 
-            if T < 1:
-                prosody_logits = torch.zeros(
-                    B, prosody_target_len, device=backbone_features.device)
+            # Safeguard against zero-length inputs or targets
+            if T <= 1 or prosody_target_len <= 1:
+                # If features or targets are too short, create zero logits
+                if self.config.prosody_classes == 2:
+                    prosody_logits = torch.zeros(
+                        B, prosody_target_len, device=backbone_features.device)
+                else:
+                    prosody_logits = torch.zeros(
+                        B, prosody_target_len, self.config.prosody_classes, device=backbone_features.device)
             else:
-                # Transpose and pool features
-                features_t = backbone_features.transpose(1, 2)
-                pooled_features = F.adaptive_avg_pool1d(
-                    features_t, prosody_target_len)
-                pooled_features = pooled_features.transpose(1, 2)
+                # Always use the safe pooling method that avoids adaptive pooling
+                pooled_features = self._adaptive_pool_workaround(
+                    backbone_features, prosody_target_len)
 
                 # BiLSTM processing
                 prosody_bilstm_out, _ = self.prosody_bilstm(pooled_features)
