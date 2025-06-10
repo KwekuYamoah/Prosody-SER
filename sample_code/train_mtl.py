@@ -1,15 +1,16 @@
 import torch
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from typing import Dict, Optional, List
+
 import os
+import gc
 import json
-import matplotlib.pyplot as plt
-from tqdm import tqdm
 import numpy as np
+from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 import wandb  # for experiment tracking
 from jiwer import wer, cer  # for ASR metrics
-from datasets import load_dataset, Audio  # Add datasets import
+from datasets import load_dataset, Audio
 
 from mtl_config import MTLConfig
 from mtl_model import MTLModel
@@ -37,9 +38,10 @@ class NumpyEncoder(json.JSONEncoder):
 class MTLEvaluator:
     """Class for evaluating MTL model performance"""
 
-    def __init__(self, model, device='cuda'):
+    def __init__(self, model, device='cuda', use_amp=True):
         self.model = model
         self.device = device
+        self.use_amp = use_amp
         self.model.to(device)
         self.model.eval()
 
@@ -51,16 +53,14 @@ class MTLEvaluator:
 
         for pred, target, words in zip(predictions, targets, words_batch):
             # Filter out padding tokens (ID 0) from predictions and targets
-            # Find the actual sequence length by removing padding
             target_no_pad = target[target != 0]  # Remove padding tokens
-            # Truncate prediction to target length
             pred_no_pad = pred[:len(target_no_pad)]
 
-            # Convert token IDs to text, ensuring we don't go out of bounds
+            # Convert token IDs to text
             pred_text = " ".join([words[i]
                                  for i in pred_no_pad if i < len(words)])
             target_text = " ".join([words[i]
-                                    for i in target_no_pad if i < len(words)])
+                                   for i in target_no_pad if i < len(words)])
 
             pred_texts.append(pred_text)
             target_texts.append(target_text)
@@ -121,216 +121,113 @@ class MTLEvaluator:
         return np.array(flat_preds), np.array(flat_targets)
 
     def evaluate(self, data_loader):
-        """Evaluate model on a data loader"""
-        all_predictions = {
-            'asr': [], 'prosody': [], 'emotion': []
-        }
-        all_targets = {
-            'asr': [], 'prosody': [], 'emotion': []
-        }
+        """Evaluate model on a data loader with memory optimization"""
+        all_predictions = {'asr': [], 'prosody': [], 'emotion': []}
+        all_targets = {'asr': [], 'prosody': [], 'emotion': []}
         words_batch = []
-        detailed_results = {
-            'asr': [],
-            'prosody': [],
-            'emotion': []
-        }
+        detailed_results = {'asr': [], 'prosody': [], 'emotion': []}
 
         with torch.no_grad():
-            for batch in tqdm(data_loader, desc="Evaluating"):
+            for batch_idx, batch in enumerate(tqdm(data_loader, desc="Evaluating")):
                 # Move batch to device
-                input_features = batch['input_features'].to(self.device)
+                input_features = batch['input_features'].to(
+                    self.device, non_blocking=True)
                 asr_targets = batch['asr_targets'].to(
-                    self.device) if torch.is_tensor(batch['asr_targets']) else None
-                prosody_targets = batch['prosody_targets'].to(self.device)
-                emotion_targets = batch['emotion_targets'].to(self.device)
+                    self.device, non_blocking=True) if torch.is_tensor(batch['asr_targets']) else None
+                prosody_targets = batch['prosody_targets'].to(
+                    self.device, non_blocking=True)
+                emotion_targets = batch['emotion_targets'].to(
+                    self.device, non_blocking=True)
 
-                # Get model predictions
-                outputs = self.model(
-                    input_features=input_features,
-                    asr_targets=asr_targets,
-                    prosody_targets=prosody_targets,
-                    emotion_targets=emotion_targets
-                )
+                # Get model predictions with mixed precision
+                if self.use_amp:
+                    with autocast():
+                        outputs = self.model(
+                            input_features=input_features,
+                            asr_targets=asr_targets,
+                            prosody_targets=prosody_targets,
+                            emotion_targets=emotion_targets
+                        )
+                else:
+                    outputs = self.model(
+                        input_features=input_features,
+                        asr_targets=asr_targets,
+                        prosody_targets=prosody_targets,
+                        emotion_targets=emotion_targets
+                    )
 
-                # Collect predictions and targets
-                if 'asr_logits' in outputs and asr_targets is not None:
-                    asr_preds = outputs['asr_logits'].argmax(dim=-1)
-                    all_predictions['asr'].extend(asr_preds.cpu().numpy())
-                    all_targets['asr'].extend(asr_targets.cpu().numpy())
-                    words_batch.extend(batch['words'])
+                # Process predictions in smaller chunks to save memory
+                self._process_batch_predictions(
+                    outputs, batch, all_predictions, all_targets, words_batch, detailed_results)
 
-                if 'prosody_logits' in outputs:
-                    prosody_preds = (outputs['prosody_logits'] > 0).float()
-                    all_predictions['prosody'].extend(
-                        prosody_preds.cpu().numpy())
-                    all_targets['prosody'].extend(
-                        prosody_targets.cpu().numpy())
+                # Clear cache every few batches
+                if batch_idx % 10 == 0:
+                    torch.cuda.empty_cache()
 
-                    # Store detailed prosody results
-                    for i, (pred, target, words) in enumerate(zip(prosody_preds, prosody_targets, batch['words'])):
-                        pred_np = pred.cpu().numpy()
-                        target_np = target.cpu().numpy()
+                # Delete references
+                del batch, outputs, input_features
+                if asr_targets is not None:
+                    del asr_targets
+                del prosody_targets, emotion_targets
 
-                        # Create mask for valid (non-padded) positions
-                        valid_mask = target_np != 0
+        return self._calculate_metrics(all_predictions, all_targets, words_batch, detailed_results)
 
-                        detailed_results['prosody'].append({
-                            'words': words,
-                            'predicted': pred_np,
-                            'target': target_np,
-                            'valid_mask': valid_mask,
-                            'num_valid_tokens': valid_mask.sum(),
-                            'accuracy': (pred_np[valid_mask] == target_np[valid_mask]).mean() if valid_mask.sum() > 0 else 0.0
-                        })
+    def _process_batch_predictions(self, outputs, batch, all_predictions, all_targets, words_batch, detailed_results):
+        """Process batch predictions efficiently"""
+        if 'asr_logits' in outputs and batch['asr_targets'] is not None:
+            asr_preds = outputs['asr_logits'].argmax(dim=-1).cpu()
+            asr_targets = batch['asr_targets'].cpu() if torch.is_tensor(
+                batch['asr_targets']) else batch['asr_targets']
+            all_predictions['asr'].extend(asr_preds.numpy())
+            all_targets['asr'].extend(
+                asr_targets.numpy() if torch.is_tensor(asr_targets) else asr_targets)
+            words_batch.extend(batch['words'])
+            del asr_preds
 
-                if 'emotion_logits' in outputs:
-                    emotion_preds = outputs['emotion_logits'].argmax(dim=-1)
-                    all_predictions['emotion'].extend(
-                        emotion_preds.cpu().numpy())
-                    all_targets['emotion'].extend(
-                        emotion_targets.cpu().numpy())
+        if 'prosody_logits' in outputs:
+            prosody_preds = (outputs['prosody_logits'] > 0).float().cpu()
+            prosody_targets = batch['prosody_targets'].cpu()
+            all_predictions['prosody'].extend(prosody_preds.numpy())
+            all_targets['prosody'].extend(prosody_targets.numpy())
 
-                    # Store detailed emotion results
-                    for i, (pred, target) in enumerate(zip(emotion_preds, emotion_targets)):
-                        detailed_results['emotion'].append({
-                            'predicted': pred.item(),
-                            'target': target.item()
-                        })
+            for i, (pred, target, words) in enumerate(zip(prosody_preds, prosody_targets, batch['words'])):
+                pred_np = pred.numpy()
+                target_np = target.numpy()
+                valid_mask = target_np != 0
+                detailed_results['prosody'].append({
+                    'words': words,
+                    'predicted': pred_np,
+                    'target': target_np,
+                    'valid_mask': valid_mask,
+                    'num_valid_tokens': valid_mask.sum(),
+                    'accuracy': (pred_np[valid_mask] == target_np[valid_mask]).mean() if valid_mask.sum() > 0 else 0.0
+                })
+            del prosody_preds, prosody_targets
 
-        # Calculate metrics
+        if 'emotion_logits' in outputs:
+            emotion_preds = outputs['emotion_logits'].argmax(dim=-1).cpu()
+            emotion_targets = batch['emotion_targets'].cpu()
+            all_predictions['emotion'].extend(emotion_preds.numpy())
+            all_targets['emotion'].extend(emotion_targets.numpy())
+
+            for i, (pred, target) in enumerate(zip(emotion_preds, emotion_targets)):
+                detailed_results['emotion'].append({
+                    'predicted': pred.item(),
+                    'target': target.item()
+                })
+            del emotion_preds, emotion_targets
+
+    def _calculate_metrics(self, all_predictions, all_targets, words_batch, detailed_results):
+        """Calculate metrics efficiently"""
         metrics = {}
         for task in ['asr', 'prosody', 'emotion']:
             if len(all_predictions[task]) > 0:
                 if task == 'asr':
-                    # Compute ASR-specific metrics
-                    asr_metrics = self.compute_asr_metrics(
+                    metrics[task] = self.compute_asr_metrics(
                         all_predictions[task],
                         all_targets[task],
                         words_batch
                     )
-                    metrics[task] = asr_metrics
-                elif task == 'prosody':
-                    # For prosody (sequence labeling)
-                    flat_preds, flat_targets = self.flatten_and_filter_sequences(
-                        all_predictions[task], all_targets[task]
-                    )
-                    if len(flat_preds) > 0:
-                        metrics[task] = {
-                            'accuracy': accuracy_score(flat_targets, flat_preds),
-                            'f1': f1_score(flat_targets, flat_preds, average='weighted', zero_division=0),
-                            'precision': precision_score(flat_targets, flat_preds, average='weighted', zero_division=0),
-                            'recall': recall_score(flat_targets, flat_preds, average='weighted', zero_division=0),
-                            'detailed_results': detailed_results[task]
-                        }
-                    else:
-                        metrics[task] = {
-                            'accuracy': 0.0, 'f1': 0.0, 'precision': 0.0, 'recall': 0.0}
-                else:  # emotion
-                    # For emotion classification (single label per sample)
-                    preds = np.array(all_predictions[task])
-                    targets = np.array(all_targets[task])
-
-                    # Ensure 1D arrays
-                    if preds.ndim > 1:
-                        preds = preds.flatten()
-                    if targets.ndim > 1:
-                        targets = targets.flatten()
-
-                    metrics[task] = {
-                        'accuracy': accuracy_score(targets, preds),
-                        'f1': f1_score(targets, preds, average='weighted', zero_division=0),
-                        'precision': precision_score(targets, preds, average='weighted', zero_division=0),
-                        'recall': recall_score(targets, preds, average='weighted', zero_division=0),
-                        'detailed_results': detailed_results[task]
-                    }
-
-        return metrics
-
-    def evaluate_with_tracking(self, data_loader, track_predictions=False, save_dir='analysis'):
-        """Evaluate model with optional prediction tracking"""
-        tracker = PredictionTracker(save_dir) if track_predictions else None
-
-        all_predictions = {'asr': [], 'prosody': [], 'emotion': []}
-        all_targets = {'asr': [], 'prosody': [], 'emotion': []}
-        words_batch = []
-        detailed_results = {'asr': [], 'prosody': [],
-                            'emotion': []}  # Add this line
-
-        with torch.no_grad():
-            for batch in tqdm(data_loader, desc="Evaluating"):
-                # Move batch to device
-                input_features = batch['input_features'].to(self.device)
-                asr_targets = batch['asr_targets'].to(
-                    self.device) if torch.is_tensor(batch['asr_targets']) else None
-                prosody_targets = batch['prosody_targets'].to(self.device)
-                emotion_targets = batch['emotion_targets'].to(self.device)
-
-                # Get model predictions
-                outputs = self.model(
-                    input_features=input_features,
-                    asr_targets=asr_targets,
-                    prosody_targets=prosody_targets,
-                    emotion_targets=emotion_targets
-                )
-
-                # Track predictions if enabled
-                if tracker:
-                    tracker.add_batch_predictions(batch, outputs)
-
-                # Collect predictions and targets
-                if 'asr_logits' in outputs and asr_targets is not None:
-                    asr_preds = outputs['asr_logits'].argmax(dim=-1)
-                    all_predictions['asr'].extend(asr_preds.cpu().numpy())
-                    all_targets['asr'].extend(asr_targets.cpu().numpy())
-                    words_batch.extend(batch['words'])
-
-                if 'prosody_logits' in outputs:
-                    prosody_preds = (outputs['prosody_logits'] > 0).float()
-                    all_predictions['prosody'].extend(
-                        prosody_preds.cpu().numpy())
-                    all_targets['prosody'].extend(
-                        prosody_targets.cpu().numpy())
-
-                    # Store detailed prosody results for print_detailed_results
-                    for i, (pred, target, words) in enumerate(zip(prosody_preds, prosody_targets, batch['words'])):
-                        pred_np = pred.cpu().numpy()
-                        target_np = target.cpu().numpy()
-
-                        # Create mask for valid (non-padded) positions
-                        valid_mask = target_np != 0
-
-                        detailed_results['prosody'].append({
-                            'words': words,
-                            'predicted': pred_np,
-                            'target': target_np,
-                            'valid_mask': valid_mask,
-                            'num_valid_tokens': valid_mask.sum(),
-                            'accuracy': (pred_np[valid_mask] == target_np[valid_mask]).mean() if valid_mask.sum() > 0 else 0.0
-                        })
-
-                if 'emotion_logits' in outputs:
-                    emotion_preds = outputs['emotion_logits'].argmax(dim=-1)
-                    all_predictions['emotion'].extend(
-                        emotion_preds.cpu().numpy())
-                    all_targets['emotion'].extend(
-                        emotion_targets.cpu().numpy())
-
-                    # Store detailed emotion results for print_detailed_results
-                    for i, (pred, target) in enumerate(zip(emotion_preds, emotion_targets)):
-                        detailed_results['emotion'].append({
-                            'predicted': pred.item(),
-                            'target': target.item()
-                        })
-
-        # Calculate metrics
-        metrics = {}
-        for task in ['asr', 'prosody', 'emotion']:
-            if len(all_predictions[task]) > 0:
-                if task == 'asr':
-                    asr_metrics = self.compute_asr_metrics(
-                        all_predictions[task], all_targets[task], words_batch
-                    )
-                    metrics[task] = asr_metrics
                 elif task == 'prosody':
                     flat_preds, flat_targets = self.flatten_and_filter_sequences(
                         all_predictions[task], all_targets[task]
@@ -341,7 +238,6 @@ class MTLEvaluator:
                             'f1': f1_score(flat_targets, flat_preds, average='weighted', zero_division=0),
                             'precision': precision_score(flat_targets, flat_preds, average='weighted', zero_division=0),
                             'recall': recall_score(flat_targets, flat_preds, average='weighted', zero_division=0),
-                            # Add detailed results
                             'detailed_results': detailed_results[task]
                         }
                     else:
@@ -362,20 +258,8 @@ class MTLEvaluator:
                         'f1': f1_score(targets, preds, average='weighted', zero_division=0),
                         'precision': precision_score(targets, preds, average='weighted', zero_division=0),
                         'recall': recall_score(targets, preds, average='weighted', zero_division=0),
-                        # Add detailed results
                         'detailed_results': detailed_results[task]
                     }
-
-        # Save tracking results if enabled
-        if tracker:
-            tracker.save_predictions()
-            analysis = tracker.analyze_predictions()
-            print("\n=== Prediction Analysis Summary ===")
-            for task, task_analysis in analysis.items():
-                print(f"\n{task.upper()} Task:")
-                for key, value in task_analysis.items():
-                    if not isinstance(value, (list, dict)):
-                        print(f"  {key}: {value}")
 
         return metrics
 
@@ -383,53 +267,40 @@ class MTLEvaluator:
         """Print detailed results for each task"""
         print("\nDetailed Evaluation Results:")
 
-        # ASR Results
-        if 'asr' in metrics:
-            print("\nASR Results:")
-            print(f"Overall WER: {metrics['asr']['wer']:.4f}")
-            print(f"Overall CER: {metrics['asr']['cer']:.4f}")
-            print("\nSample Predictions:")
-            # Show first 5 examples
-            for i, result in enumerate(metrics['asr']['detailed_results'][:5]):
-                print(f"\nExample {i+1}:")
-                print(f"Target: {result['target']}")
-                print(f"Predicted: {result['predicted']}")
+        for task in ['asr', 'prosody', 'emotion']:
+            if task in metrics:
+                print(f"\n{task.upper()} Results:")
+                for metric_name, value in metrics[task].items():
+                    if metric_name != 'detailed_results':
+                        print(f"{metric_name}: {value:.4f}")
 
-        # Prosody Results
-        if 'prosody' in metrics:
-            print("\nProsody Results:")
-            print(f"Overall Accuracy: {metrics['prosody']['accuracy']:.4f}")
-            print(f"Overall F1: {metrics['prosody']['f1']:.4f}")
-            print("\nSample Predictions:")
-            # Show first 5 examples
-            for i, result in enumerate(metrics['prosody']['detailed_results'][:5]):
-                print(f"\nExample {i+1}:")
-                print("Words:", " ".join(result['words']))
-                print("Target Prominence:", " ".join(
-                    map(str, result['target'])))
-                print("Predicted Prominence:", " ".join(
-                    map(str, result['predicted'])))
+                print("\nSample Predictions:")
+                for i, result in enumerate(metrics[task]['detailed_results'][:5]):
+                    print(f"\nExample {i+1}:")
+                    if task == 'asr':
+                        print(f"Target: {result['target']}")
+                        print(f"Predicted: {result['predicted']}")
+                    elif task == 'prosody':
+                        print("Words:", " ".join(result['words']))
+                        print("Target Prominence:", " ".join(
+                            map(str, result['target'])))
+                        print("Predicted Prominence:", " ".join(
+                            map(str, result['predicted'])))
+                    else:  # emotion
+                        print(f"Target Emotion: {result['target']}")
+                        print(f"Predicted Emotion: {result['predicted']}")
 
-        # Emotion Results
-        if 'emotion' in metrics:
-            print("\nEmotion Results:")
-            print(f"Overall Accuracy: {metrics['emotion']['accuracy']:.4f}")
-            print(f"Overall F1: {metrics['emotion']['f1']:.4f}")
-            print("\nSample Predictions:")
-            # Show first 5 examples
-            for i, result in enumerate(metrics['emotion']['detailed_results'][:5]):
-                print(f"\nExample {i+1}:")
-                print(f"Target Emotion: {result['target']}")
-                print(f"Predicted Emotion: {result['predicted']}")
 
 class MTLTrainer:
     """Enhanced trainer class with monitoring and visualization"""
 
-    def __init__(self, model, device='cuda', use_wandb=False):
+    def __init__(self, model, device='cuda', use_wandb=False, use_amp=True):
         self.model = model
         self.device = device
         self.model.to(device)
         self.use_wandb = use_wandb
+        self.use_amp = use_amp
+        self.scaler = GradScaler() if use_amp else None
         self.history = {
             'train_loss': [], 'val_loss': [],
             'train_metrics': [], 'val_metrics': []
@@ -446,15 +317,25 @@ class MTLTrainer:
         asr_lengths = batch['asr_lengths'].to(self.device)
         prosody_targets = batch['prosody_targets'].to(self.device)
         emotion_targets = batch['emotion_targets'].to(self.device)
-
-        outputs = self.model(
-            input_features=input_features,
-            asr_targets=asr_targets,
-            asr_lengths=asr_lengths,
-            prosody_targets=prosody_targets,
-            emotion_targets=emotion_targets,
-            return_loss=True
-        )
+        if self.use_amp:
+            with autocast():
+                outputs = self.model(
+                    input_features=input_features,
+                    asr_targets=asr_targets,
+                    asr_lengths=asr_lengths,
+                    prosody_targets=prosody_targets,
+                    emotion_targets=emotion_targets,
+                    return_loss=True
+                )
+        else:
+            outputs = self.model(
+                input_features=input_features,
+                asr_targets=asr_targets,
+                asr_lengths=asr_lengths,
+                prosody_targets=prosody_targets,
+                emotion_targets=emotion_targets,
+                return_loss=True
+            )
 
         return outputs
 
@@ -463,13 +344,22 @@ class MTLTrainer:
         epoch_losses = {'total': 0, 'asr': 0, 'prosody': 0, 'emotion': 0}
         num_batches = 0
 
-        for batch in tqdm(train_loader, desc="Training"):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc="Training")):
             optimizer.zero_grad()
-            outputs = self.train_step(batch)
 
-            total_loss = outputs['total_loss']
-            total_loss.backward()
-            optimizer.step()
+            if self.use_amp:
+
+                outputs = self.train_step(batch)
+                total_loss = outputs['total_loss']
+
+                # Scale and backward
+                self.scaler.scale(total_loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            else:
+                outputs = self.train_step(batch)
+                total_loss.backward()
+                optimizer.step()
 
             # Accumulate losses
             epoch_losses['total'] += total_loss.item()
@@ -481,6 +371,13 @@ class MTLTrainer:
                 epoch_losses['emotion'] += outputs['emotion_loss'].item()
 
             num_batches += 1
+
+            # clear cache periodically
+            if batch_idx % 50 == 0:
+                torch.cuda.empty_cache()
+
+            # Delete references to free memory
+            del batch, outputs, total_loss
 
         # Average losses
         for key in epoch_losses:
@@ -596,7 +493,7 @@ class MTLTrainer:
         num_batches = 0
 
         with torch.no_grad():
-            for batch in data_loader:
+            for batch_idx, batch in enumerate(data_loader):
                 # Move batch to device
                 input_features = batch['input_features'].to(self.device)
                 asr_targets = batch['asr_targets'].to(
@@ -604,15 +501,25 @@ class MTLTrainer:
                 asr_lengths = batch['asr_lengths'].to(self.device)
                 prosody_targets = batch['prosody_targets'].to(self.device)
                 emotion_targets = batch['emotion_targets'].to(self.device)
-
-                outputs = self.model(
-                    input_features=input_features,
-                    asr_targets=asr_targets,
-                    asr_lengths=asr_lengths,
-                    prosody_targets=prosody_targets,
-                    emotion_targets=emotion_targets,
-                    return_loss=True
-                )
+                if self.use_amp:
+                    with autocast():
+                        outputs = self.model(
+                            input_features=input_features,
+                            asr_targets=asr_targets,
+                            asr_lengths=asr_lengths,
+                            prosody_targets=prosody_targets,
+                            emotion_targets=emotion_targets,
+                            return_loss=True
+                        )
+                else:
+                    outputs = self.model(
+                        input_features=input_features,
+                        asr_targets=asr_targets,
+                        asr_lengths=asr_lengths,
+                        prosody_targets=prosody_targets,
+                        emotion_targets=emotion_targets,
+                        return_loss=True
+                    )
 
                 losses['total'] += outputs['total_loss'].item()
                 if 'asr_loss' in outputs:
@@ -623,6 +530,13 @@ class MTLTrainer:
                     losses['emotion'] += outputs['emotion_loss'].item()
 
                 num_batches += 1
+
+                # Clear cache periodically
+                if batch_idx % 20 == 0:
+                    torch.cuda.empty_cache()
+
+                # Delete references
+                del batch, outputs
 
         # Average losses
         for key in losses:
@@ -690,6 +604,8 @@ class MTLTrainer:
 
     def plot_training_history(self, save_path=None):
         """Plot training history"""
+        import matplotlib.pyplot as plt
+
         if len(self.history['train_loss']) == 0:
             print("No training history to plot")
             return
@@ -731,195 +647,6 @@ class MTLTrainer:
         plt.show()
 
 
-class PredictionTracker:
-    """Class to track and analyze model predictions across tasks"""
-
-    def __init__(self, save_dir='analysis'):
-        self.save_dir = save_dir
-        os.makedirs(save_dir, exist_ok=True)
-        self.predictions = {
-            'asr': [],
-            'prosody': [],
-            'emotion': []
-        }
-
-    def add_batch_predictions(self, batch_data, outputs):
-        """Add predictions from a single batch"""
-
-        # ASR predictions
-        if 'asr_logits' in outputs and 'asr_targets' in batch_data:
-            asr_preds = outputs['asr_logits'].argmax(dim=-1)
-            asr_targets = batch_data['asr_targets']
-            words_batch = batch_data['words']
-
-            for i, (pred, target, words) in enumerate(zip(asr_preds, asr_targets, words_batch)):
-                # Remove padding tokens
-                target_no_pad = target[target != 0].cpu().numpy()
-                pred_no_pad = pred[:len(target_no_pad)].cpu().numpy()
-
-                pred_text = " ".join([words[j]
-                                     for j in pred_no_pad if j < len(words)])
-                target_text = " ".join([words[j]
-                                        for j in target_no_pad if j < len(words)])
-
-                # Calculate individual WER/CER only for non-empty targets
-                if target_text.strip():
-                    individual_wer = wer([target_text], [pred_text])
-                    individual_cer = cer([target_text], [pred_text])
-                else:
-                    individual_wer = 0.0
-                    individual_cer = 0.0
-
-                self.predictions['asr'].append({
-                    'sample_id': len(self.predictions['asr']),
-                    'words': words,
-                    'target_text': target_text,
-                    'predicted_text': pred_text,
-                    'wer': individual_wer,
-                    'cer': individual_cer,
-                    'target_ids': target_no_pad.tolist(),
-                    'predicted_ids': pred_no_pad.tolist(),
-                    'original_target_length': len(target),
-                    'valid_target_length': len(target_no_pad)
-                })
-
-        # Prosody predictions
-        if 'prosody_logits' in outputs:
-            prosody_preds = (outputs['prosody_logits'] > 0).float()
-            prosody_targets = batch_data['prosody_targets']
-            words_batch = batch_data['words']
-
-            for i, (pred, target, words) in enumerate(zip(prosody_preds, prosody_targets, words_batch)):
-                pred_np = pred.cpu().numpy()
-                target_np = target.cpu().numpy()
-
-                # Create mask for valid positions (non-padding)
-                valid_positions = target_np != 0
-                if valid_positions.sum() > 0:
-                    word_accuracy = (pred_np[valid_positions]
-                                     == target_np[valid_positions]).mean()
-                else:
-                    word_accuracy = 0.0
-
-                self.predictions['prosody'].append({
-                    'sample_id': len(self.predictions['prosody']),
-                    'words': words,
-                    'target_prominence': target_np.tolist(),
-                    'predicted_prominence': pred_np.tolist(),
-                    'valid_mask': valid_positions.tolist(),
-                    'word_accuracy': word_accuracy,
-                    'num_words': len(words),
-                    'num_valid_positions': int(valid_positions.sum()),
-                    'num_prominent_true': int(target_np[valid_positions].sum()) if valid_positions.sum() > 0 else 0,
-                    'num_prominent_pred': int(pred_np[valid_positions].sum()) if valid_positions.sum() > 0 else 0
-                })
-
-        # Emotion predictions
-        if 'emotion_logits' in outputs:
-            emotion_preds = outputs['emotion_logits'].argmax(dim=-1)
-            emotion_targets = batch_data['emotion_targets']
-            words_batch = batch_data['words']
-
-            for i, (pred, target, words) in enumerate(zip(emotion_preds, emotion_targets, words_batch)):
-                self.predictions['emotion'].append({
-                    'sample_id': len(self.predictions['emotion']),
-                    'words': words,
-                    'target_emotion': target.item(),
-                    'predicted_emotion': pred.item(),
-                    'correct': (pred.item() == target.item()),
-                    'utterance_text': " ".join(words)
-                })
-
-    def save_predictions(self):
-        """Save all predictions to files"""
-        for task, preds in self.predictions.items():
-            if preds:
-                save_path = os.path.join(
-                    self.save_dir, f'{task}_predictions.json')
-                with open(save_path, 'w', encoding='utf-8') as f:
-                    json.dump(preds, f, indent=2,
-                              ensure_ascii=False, cls=NumpyEncoder)
-                print(f"Saved {len(preds)} {task} predictions to {save_path}")
-
-    def analyze_predictions(self):
-        """Generate analysis reports"""
-        analysis = {}
-
-        # ASR Analysis
-        if self.predictions['asr']:
-            asr_preds = self.predictions['asr']
-            analysis['asr'] = {
-                'total_samples': len(asr_preds),
-                'average_wer': float(np.mean([p['wer'] for p in asr_preds])),
-                'average_cer': float(np.mean([p['cer'] for p in asr_preds])),
-                'worst_wer_samples': sorted(asr_preds, key=lambda x: x['wer'], reverse=True)[:5],
-                'best_wer_samples': sorted(asr_preds, key=lambda x: x['wer'])[:5]
-            }
-
-        # Prosody Analysis
-        if self.predictions['prosody']:
-            prosody_preds = self.predictions['prosody']
-            analysis['prosody'] = {
-                'total_samples': len(prosody_preds),
-                'average_word_accuracy': float(np.mean([p['word_accuracy'] for p in prosody_preds])),
-                'prominence_precision': float(self._calculate_prominence_precision(prosody_preds)),
-                'prominence_recall': float(self._calculate_prominence_recall(prosody_preds)),
-                'worst_accuracy_samples': sorted(prosody_preds, key=lambda x: x['word_accuracy'])[:5]
-            }
-
-        # Emotion Analysis
-        if self.predictions['emotion']:
-            emotion_preds = self.predictions['emotion']
-            analysis['emotion'] = {
-                'total_samples': len(emotion_preds),
-                'accuracy': float(np.mean([p['correct'] for p in emotion_preds])),
-                'confusion_matrix': self._calculate_emotion_confusion(emotion_preds),
-                'misclassified_samples': [p for p in emotion_preds if not p['correct']][:10]
-            }
-
-        # Save analysis
-        analysis_path = os.path.join(self.save_dir, 'prediction_analysis.json')
-        with open(analysis_path, 'w', encoding='utf-8') as f:
-            json.dump(analysis, f, indent=2,
-                      ensure_ascii=False, cls=NumpyEncoder)
-
-        return analysis
-
-    def _calculate_prominence_precision(self, prosody_preds):
-        """Calculate precision for prominence detection"""
-        true_pos = sum(
-            np.sum((np.array(p['predicted_prominence']) == 1) &
-                   (np.array(p['target_prominence']) == 1))
-            for p in prosody_preds
-        )
-        pred_pos = sum(
-            np.sum(np.array(p['predicted_prominence']) == 1) for p in prosody_preds)
-        return true_pos / pred_pos if pred_pos > 0 else 0.0
-
-    def _calculate_prominence_recall(self, prosody_preds):
-        """Calculate recall for prominence detection"""
-        true_pos = sum(
-            np.sum((np.array(p['predicted_prominence']) == 1) &
-                   (np.array(p['target_prominence']) == 1))
-            for p in prosody_preds
-        )
-        actual_pos = sum(
-            np.sum(np.array(p['target_prominence']) == 1) for p in prosody_preds)
-        return true_pos / actual_pos if actual_pos > 0 else 0.0
-
-    def _calculate_emotion_confusion(self, emotion_preds):
-        """Calculate confusion matrix for emotions"""
-        from collections import defaultdict
-        confusion = defaultdict(lambda: defaultdict(int))
-
-        for pred in emotion_preds:
-            true_label = pred['target_emotion']
-            pred_label = pred['predicted_emotion']
-            confusion[true_label][pred_label] += 1
-
-        return dict(confusion)
-
-
 def prepare_text_for_training(dataset_dict, output_path):
     """Extracts all text from the dataset and saves to a file for SentencePiece training"""
     all_text = []
@@ -950,94 +677,18 @@ def setup_tokenizer_and_dataset(dataset_dict, vocab_size=4000, model_prefix='aka
     return tokenizer
 
 
-def create_mtl_system(
-    dataset_dict: Dict,
-    backbone_name: str = "whisper",
-    use_asr: bool = True,
-    use_prosody: bool = True,
-    use_ser: bool = True,
-    vocab_size: int = 4000,
-    batch_size: int = 8,
-    retrain_tokenizer: bool = False,
-    tokenizer_path: Optional[str] = None,
-    **kwargs
-):
-    """
-    Create complete MTL system with configurable backbone
+def create_loaders(dataset_dict, config, batch_size, tokenizer, num_workers=2):
+    """Create memory efficient data loaders"""
+    train_dataset = MTLDataset(dataset_dict, split='train', config=config)
+    val_dataset = MTLDataset(dataset_dict, split='val', config=config)
 
-    Args:
-        dataset_dict: Your dataset dictionary
-        backbone_name: Name of the backbone model to use
-        use_asr, use_prosody, use_ser: Enable/disable specific heads
-        vocab_size: Size of vocabulary
-        batch_size: Batch size for training
-        retrain_tokenizer: Whether to retrain the tokenizer
-        tokenizer_path: Path to existing tokenizer model
-        **kwargs: Additional arguments for MTLConfig
-    """
-    # Setup SentencePiece tokenizer
-    if retrain_tokenizer or tokenizer_path is None:
-        print("Training new SentencePiece tokenizer...")
-        tokenizer = setup_tokenizer_and_dataset(
-            dataset_dict, vocab_size=vocab_size)
-        if tokenizer_path:
-            # Save the newly trained tokenizer
-            tokenizer.model_path = tokenizer_path
-            tokenizer.sp.save(tokenizer_path)
-    else:
-        print(f"Loading existing tokenizer from {tokenizer_path}")
-        tokenizer = SentencePieceTokenizer(model_path=tokenizer_path)
-        tokenizer.load_tokenizer()
-
-    print(f"Tokenizer vocabulary size: {tokenizer.get_vocab_size()}")
-    print(
-        f"Special tokens - Blank: {tokenizer.blank_id}, Pad: {tokenizer.pad_id}, UNK: {tokenizer.unk_id}")
-
-    # Create config with correct vocabulary size
-    config = MTLConfig(
-        backbone_name=backbone_name,
-        vocab_size=tokenizer.get_vocab_size(),
-        emotion_classes=9,  # 9 classes dataset
-        prosody_classes=2,  # Binary prominence
-        **kwargs
-    )
-
-    # Create model
-    model = MTLModel(
-        config=config,
-        use_asr=use_asr,
-        use_prosody=use_prosody,
-        use_ser=use_ser,
-        tokenizer=tokenizer
-    )
-
-    print(f"Created MTL model with backbone: {backbone_name}")
-    print(f"Active heads: {model.get_active_heads()}")
-
-    # Create datasets
-    train_dataset = MTLDataset(
-        dataset_dict,
-        split='train',
-        config=config
-    )
-
-    val_dataset = MTLDataset(
-        dataset_dict,
-        split='val',
-        config=config
-    )
-
-    test_dataset = MTLDataset(
-        dataset_dict,
-        split='test',
-        config=config
-    )
-
-    # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
         collate_fn=lambda batch: collate_fn_mtl(
             batch, pad_token_id=tokenizer.pad_id)
     )
@@ -1046,19 +697,94 @@ def create_mtl_system(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
         collate_fn=lambda batch: collate_fn_mtl(
             batch, pad_token_id=tokenizer.pad_id)
     )
 
+    return train_loader, val_loader, train_dataset, val_dataset
+
+
+def create_test_loader(dataset_dict, config, batch_size, tokenizer, num_workers=2):
+    """Create test loader separately"""
+    test_dataset = MTLDataset(dataset_dict, split='test', config=config)
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
         collate_fn=lambda batch: collate_fn_mtl(
             batch, pad_token_id=tokenizer.pad_id)
     )
+    return test_loader, test_dataset
 
-    return model, train_loader, val_loader, test_loader, tokenizer
+
+def cleanup_training_data(train_loader, val_loader, train_dataset, val_dataset):
+    """Clean up training data from memory"""
+    del train_loader, val_loader, train_dataset, val_dataset
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("Training data cleaned from memory")
+
+
+def training_loop(
+    model, train_loader, val_loader, optimizer, num_epochs,
+    save_dir, device, use_wandb=False, use_amp=True
+):
+    """Memory efficient training loop"""
+
+    # Initialize trainer with memory optimizations
+    trainer = MTLTrainer(
+        model, device=device, use_wandb=use_wandb, use_amp=use_amp
+    )
+
+    # Enable gradient checkpointing if available
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+
+    # Train model
+    trainer.train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        num_epochs=num_epochs,
+        save_dir=save_dir
+    )
+
+    return trainer
+
+
+def test_evaluation(
+    model, dataset_dict, config, batch_size, tokenizer,
+    save_dir, device, use_amp=True
+):
+    """Memory efficient test evaluation"""
+
+    print("Loading test data...")
+    test_loader, test_dataset = create_test_loader(
+        dataset_dict, config, batch_size, tokenizer
+    )
+
+    # Load best model
+    trainer = MTLTrainer(model, device=device, use_amp=use_amp)
+    trainer.load_checkpoint(os.path.join(save_dir, 'best_model.pt'))
+
+    # Create memory efficient evaluator
+    evaluator = MTLEvaluator(model, device, use_amp=use_amp)
+
+    # Evaluate with detailed prediction tracking
+    test_metrics = evaluator.evaluate(test_loader)
+
+    # Clean up test data
+    del test_loader, test_dataset
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return test_metrics
 
 
 def collate_fn_mtl(batch, pad_token_id=0):
@@ -1118,8 +844,52 @@ def collate_fn_mtl(batch, pad_token_id=0):
     }
 
 
+def plot_training_history(history, save_path=None):
+    """Plot training history"""
+    import matplotlib.pyplot as plt
+
+    if len(history['train_loss']) == 0:
+        print("No training history to plot")
+        return
+
+    plt.figure(figsize=(15, 10))
+
+    # Plot losses
+    plt.subplot(2, 1, 1)
+    epochs = range(len(history['train_loss']))
+    plt.plot(epochs, [x['total']
+             for x in history['train_loss']], label='Train Loss')
+    plt.plot(epochs, [x['total']
+             for x in history['val_loss']], label='Val Loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+
+    # Plot metrics
+    plt.subplot(2, 1, 2)
+    if len(history['val_metrics']) > 0:
+        for task in ['asr', 'prosody', 'emotion']:
+            if task in history['val_metrics'][0]:
+                metric_key = 'accuracy' if task != 'asr' else 'wer'
+                if metric_key in history['val_metrics'][0][task]:
+                    values = [x[task][metric_key]
+                              for x in history['val_metrics']]
+                    plt.plot(
+                        epochs, values, label=f'{task.capitalize()} {metric_key.upper()}')
+
+    plt.title('Validation Metrics')
+    plt.xlabel('Epoch')
+    plt.ylabel('Metric Value')
+    plt.legend()
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+    plt.show()
+
+
 if __name__ == "__main__":
-    # Example usage
     import argparse
 
     parser = argparse.ArgumentParser()
@@ -1131,6 +901,10 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--use_amp", action="store_true", default=True,
+                        help="Use automatic mixed precision training")
+    parser.add_argument("--num_workers", type=int, default=2,
+                        help="Number of data loader workers")
     parser.add_argument("--retrain_tokenizer", action="store_true",
                         help="Whether to retrain the tokenizer")
     parser.add_argument("--tokenizer_path", type=str,
@@ -1146,15 +920,29 @@ if __name__ == "__main__":
                         help="Path to test JSONL file")
     args = parser.parse_args()
 
-    # Set device
+    # Set device and optimize CUDA settings
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    if torch.cuda.is_available():
+        # Optimize CUDA memory management
+        torch.backends.cudnn.benchmark = True
+        torch.cuda.empty_cache()
+        print(
+            f"GPU Memory before start: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
     # Initialize wandb if enabled
     if args.use_wandb:
         wandb.init(project="mtl-speech", config=vars(args))
 
-    # Load dataset with specified paths
+    # ============================================================================
+    # PHASE 1: LOAD TRAINING DATA AND TRAIN MODEL
+    # ============================================================================
+    print("\n" + "="*50)
+    print("PHASE 1: LOADING TRAINING DATA")
+    print("="*50)
+
+    # Load only train and val data first
     data_files = {
         "train": args.train_jsonl,
         "val": args.val_jsonl,
@@ -1163,62 +951,188 @@ if __name__ == "__main__":
 
     dataset_dict = load_dataset("json", data_files=data_files)
 
-    # Process audio paths and convert to Audio objects
+    # Process audio paths for train and val only
     for split in ["train", "val", "test"]:
-        # Add audio base path to the audio_filepath
         dataset_dict[split] = dataset_dict[split].map(
             lambda x: {"audio_filepath": os.path.join(
                 args.audio_base_path, x["audio_filepath"])}
         )
-        # Cast to Audio with 16000Hz sampling rate
         dataset_dict[split] = dataset_dict[split].cast_column(
             "audio_filepath", Audio(sampling_rate=16000))
 
-    # Create MTL system
-    model, train_loader, val_loader, test_loader, tokenizer = create_mtl_system(
-        dataset_dict=dataset_dict,
+    print(f"Loaded train: {len(dataset_dict['train'])} samples")
+    print(f"Loaded val: {len(dataset_dict['val'])} samples")
+
+    # Setup tokenizer (only using train/val data)
+    if args.retrain_tokenizer or args.tokenizer_path is None:
+        print("Training new SentencePiece tokenizer...")
+        tokenizer = setup_tokenizer_and_dataset(
+            dataset_dict, vocab_size=args.vocab_size)
+        if args.tokenizer_path:
+            tokenizer.model_path = args.tokenizer_path
+            tokenizer.sp.save(args.tokenizer_path)
+    else:
+        print(f"Loading existing tokenizer from {args.tokenizer_path}")
+        tokenizer = SentencePieceTokenizer(model_path=args.tokenizer_path)
+        tokenizer.load_tokenizer()
+
+    print(f"Tokenizer vocabulary size: {tokenizer.get_vocab_size()}")
+
+    # Create config
+    config = MTLConfig(
         backbone_name=args.backbone,
-        batch_size=args.batch_size,
-        vocab_size=args.vocab_size,
-        retrain_tokenizer=args.retrain_tokenizer,
-        tokenizer_path=args.tokenizer_path
+        vocab_size=tokenizer.get_vocab_size(),
+        emotion_classes=9,
+        prosody_classes=2,
+        loss_weights={
+            'asr': 0.0,
+            'prosody': 1.0,
+            'ser': 1.0
+        },
+
     )
 
-    # Move model to device
+    # Create model
+    model = MTLModel(
+        config=config,
+        use_asr=False,
+        use_prosody=True,
+        use_ser=True,
+        tokenizer=tokenizer
+    ).to(device)
+
+    print(f"Created MTL model with backbone: {args.backbone}")
+    print(f"Active heads: {model.get_active_heads()}")
+
+    # Move model to device with memory optimization
     model = model.to(device)
 
-    # Initialize trainer and optimizer
-    trainer = MTLTrainer(model, device=device, use_wandb=args.use_wandb)
+    if torch.cuda.is_available():
+        print(
+            f"GPU Memory after model load: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+    # Create memory efficient data loaders for training
+    train_loader, val_loader, train_dataset, val_dataset = create_loaders(
+        dataset_dict, config, args.batch_size, tokenizer, args.num_workers
+    )
+
+    print(f"Created data loaders with batch size: {args.batch_size}")
+
+    if torch.cuda.is_available():
+        print(
+            f"GPU Memory after data loaders: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+    # ============================================================================
+    # PHASE 2: TRAIN MODEL
+    # ============================================================================
+    print("\n" + "="*50)
+    print("PHASE 2: TRAINING MODEL")
+    print("="*50)
+
+    # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    # Train model
-    trainer.train(
+    # Train model with memory optimizations
+    trainer = training_loop(
+        model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         optimizer=optimizer,
         num_epochs=args.num_epochs,
-        save_dir=args.save_dir
+        save_dir=args.save_dir,
+        device=device,
+        use_wandb=args.use_wandb,
+        use_amp=args.use_amp
     )
 
     # Plot training history
-    trainer.plot_training_history(os.path.join(
+    plot_training_history(trainer.history, os.path.join(
         args.save_dir, 'training_history.png'))
 
-    # Load best model and evaluate on test set
-    trainer.load_checkpoint(os.path.join(args.save_dir, 'best_model.pt'))
-    evaluator = MTLEvaluator(model, device)
+    print("\nTraining completed!")
 
-    # Evaluate with detailed prediction tracking
-    test_metrics = evaluator.evaluate_with_tracking(
-        test_loader,
-        track_predictions=True,
-        save_dir=os.path.join(args.save_dir, 'predictions')
+    if torch.cuda.is_available():
+        print(
+            f"GPU Memory after training: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+    # ============================================================================
+    # PHASE 3: CLEAN UP TRAINING DATA
+    # ============================================================================
+    print("\n" + "="*50)
+    print("PHASE 3: CLEANING UP TRAINING DATA")
+    print("="*50)
+
+    # Clean up training data to free memory
+    cleanup_training_data(train_loader, val_loader, train_dataset, val_dataset)
+
+    # Also clean up the dataset_dict for train/val
+    del dataset_dict
+    del trainer  # Clean up trainer as well
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    if torch.cuda.is_available():
+        print(
+            f"GPU Memory after cleanup: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+    # ============================================================================
+    # PHASE 4: LOAD TEST DATA AND EVALUATE
+    # ============================================================================
+    print("\n" + "="*50)
+    print("PHASE 4: LOADING TEST DATA AND EVALUATING")
+    print("="*50)
+
+    # Now load test data separately
+    test_data_files = {"test": args.test_jsonl}
+    test_dataset_dict = load_dataset("json", data_files=test_data_files)
+
+    # Process test audio paths
+    test_dataset_dict["test"] = test_dataset_dict["test"].map(
+        lambda x: {"audio_filepath": os.path.join(
+            args.audio_base_path, x["audio_filepath"])}
+    )
+    test_dataset_dict["test"] = test_dataset_dict["test"].cast_column(
+        "audio_filepath", Audio(sampling_rate=16000))
+
+    print(f"Loaded test: {len(test_dataset_dict['test'])} samples")
+
+    if torch.cuda.is_available():
+        print(
+            f"GPU Memory after test data load: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+    # Evaluate on test set with memory efficiency
+    test_metrics = test_evaluation(
+        model=model,
+        dataset_dict=test_dataset_dict,
+        config=config,
+        batch_size=args.batch_size,
+        tokenizer=tokenizer,
+        save_dir=args.save_dir,
+        device=device,
+        use_amp=args.use_amp
     )
 
     # Print detailed results
+    evaluator = MTLEvaluator(
+        model, device, use_amp=args.use_amp)
     evaluator.print_detailed_results(test_metrics)
 
     # Save test results
     with open(os.path.join(args.save_dir, 'test_results.json'), 'w', encoding='utf-8') as f:
         json.dump(test_metrics, f, indent=4,
                   ensure_ascii=False, cls=NumpyEncoder)
+
+    # Final cleanup
+    del test_dataset_dict, model, tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    if torch.cuda.is_available():
+        print(f"Final GPU Memory: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+    print("\n" + "="*50)
+    print("EVALUATION COMPLETED!")
+    print("="*50)
+
+    if args.use_wandb:
+        wandb.finish()
