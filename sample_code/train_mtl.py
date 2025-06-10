@@ -1,6 +1,7 @@
 import torch
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 import os
 import gc
@@ -11,12 +12,18 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 import wandb  # for experiment tracking
 from jiwer import wer, cer  # for ASR metrics
 from datasets import load_dataset, Audio
+from typing import Dict, Optional
+import matplotlib.pyplot as plt
+import math
+
 
 from mtl_config import MTLConfig
 from mtl_model import MTLModel
 from mtl_dataset import MTLDataset
 from backbone_models import BACKBONE_CONFIGS
+from backbone_models import BackboneModel
 from tokenizer import SentencePieceTokenizer
+from memory_utils import print_memory_usage, cleanup_memory, optimize_model_for_memory
 
 # Add MTLConfig to safe globals for model loading
 torch.serialization.add_safe_globals([MTLConfig])
@@ -292,14 +299,15 @@ class MTLEvaluator:
 
 
 class MTLTrainer:
-    """Enhanced trainer class with monitoring and visualization"""
+    """Enhanced trainer class with gradient accumulation support"""
 
-    def __init__(self, model, device='cuda', use_wandb=False, use_amp=True):
+    def __init__(self, model, device='cuda', use_wandb=False, use_amp=True, gradient_accumulation_steps=1):
         self.model = model
         self.device = device
         self.model.to(device)
         self.use_wandb = use_wandb
         self.use_amp = use_amp
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.scaler = GradScaler() if use_amp else None
         self.history = {
             'train_loss': [], 'val_loss': [],
@@ -317,6 +325,7 @@ class MTLTrainer:
         asr_lengths = batch['asr_lengths'].to(self.device)
         prosody_targets = batch['prosody_targets'].to(self.device)
         emotion_targets = batch['emotion_targets'].to(self.device)
+
         if self.use_amp:
             with autocast():
                 outputs = self.model(
@@ -339,30 +348,57 @@ class MTLTrainer:
 
         return outputs
 
-    def train_epoch(self, train_loader, optimizer):
-        """Train for one epoch"""
+    def train_epoch(self, train_loader, optimizer, scheduler=None):
+        """Train for one epoch with gradient accumulation"""
         epoch_losses = {'total': 0, 'asr': 0, 'prosody': 0, 'emotion': 0}
         num_batches = 0
 
+        # Zero gradients at the start
+        optimizer.zero_grad()
+
         for batch_idx, batch in enumerate(tqdm(train_loader, desc="Training")):
-            optimizer.zero_grad()
+            # Forward pass
+            outputs = self.train_step(batch)
 
+            # Scale loss by accumulation steps
+            total_loss = outputs['total_loss'] / \
+                self.gradient_accumulation_steps
+
+            # Backward pass
             if self.use_amp:
-
-                outputs = self.train_step(batch)
-                total_loss = outputs['total_loss']
-
-                # Scale and backward
                 self.scaler.scale(total_loss).backward()
-                self.scaler.step(optimizer)
-                self.scaler.update()
             else:
-                outputs = self.train_step(batch)
                 total_loss.backward()
-                optimizer.step()
 
-            # Accumulate losses
-            epoch_losses['total'] += total_loss.item()
+            # Update weights after accumulating gradients
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                if self.use_amp:
+                    # Unscale gradients before clipping
+                    self.scaler.unscale_(optimizer)
+
+                    # Clip gradients to prevent exploding gradients
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_norm=1.0)
+
+                    # Step optimizer
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    # Clip gradients
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+                # Step scheduler if provided
+                if scheduler is not None:
+                    scheduler.step()
+
+                # Zero gradients for next accumulation
+                optimizer.zero_grad()
+
+            # Accumulate losses (multiply back to get actual loss value)
+            epoch_losses['total'] += total_loss.item() * \
+                self.gradient_accumulation_steps
             if 'asr_loss' in outputs:
                 epoch_losses['asr'] += outputs['asr_loss'].item()
             if 'prosody_loss' in outputs:
@@ -372,7 +408,7 @@ class MTLTrainer:
 
             num_batches += 1
 
-            # clear cache periodically
+            # Clear cache periodically
             if batch_idx % 50 == 0:
                 torch.cuda.empty_cache()
 
@@ -384,107 +420,6 @@ class MTLTrainer:
             epoch_losses[key] /= num_batches
 
         return epoch_losses
-
-    def train(
-        self,
-        train_loader,
-        val_loader,
-        optimizer,
-        num_epochs,
-        save_dir='checkpoints',
-        early_stopping_patience=5,
-        checkpoint_interval=10
-    ):
-        """Complete training loop with improved checkpoint management"""
-        os.makedirs(save_dir, exist_ok=True)
-        best_val_loss = float('inf')
-        patience_counter = 0
-        best_epoch = 0
-
-        for epoch in range(num_epochs):
-            print(f"\nStarting epoch {epoch + 1}/{num_epochs}")
-
-            # Training
-            train_losses = self.train_epoch(train_loader, optimizer)
-
-            # Validation
-            evaluator = MTLEvaluator(self.model, self.device)
-            val_metrics = evaluator.evaluate(val_loader)
-
-            # Calculate validation loss
-            val_losses = self.evaluate_loss(val_loader)
-
-            # Log metrics (existing code...)
-            metrics = {
-                'epoch': epoch,
-                'train_total_loss': train_losses['total'],
-                'val_total_loss': val_losses['total']
-            }
-
-            for task in ['asr', 'prosody', 'emotion']:
-                if task in train_losses:
-                    metrics[f'train_{task}_loss'] = train_losses[task]
-                if task in val_losses:
-                    metrics[f'val_{task}_loss'] = val_losses[task]
-                if task in val_metrics:
-                    for metric_name, value in val_metrics[task].items():
-                        if metric_name != 'detailed_results':
-                            metrics[f'val_{task}_{metric_name}'] = value
-
-            if self.use_wandb:
-                wandb.log(metrics)
-
-            # Print epoch summary (existing code...)
-            print(f"\nEpoch {epoch + 1} Results:")
-            print(f"  Train Loss: {train_losses['total']:.4f}")
-            print(f"  Val Loss: {val_losses['total']:.4f}")
-            for task in ['asr', 'prosody', 'emotion']:
-                if task in val_metrics:
-                    print(f"  {task.capitalize()} Metrics:")
-                    for metric_name, value in val_metrics[task].items():
-                        if metric_name != 'detailed_results':
-                            print(f"    {metric_name}: {value:.4f}")
-
-            # Save history
-            self.history['train_loss'].append(train_losses)
-            self.history['val_loss'].append(val_losses)
-            self.history['train_metrics'].append(metrics)
-            self.history['val_metrics'].append(val_metrics)
-
-            # Check for best model and save
-            if val_losses['total'] < best_val_loss:
-                best_val_loss = val_losses['total']
-                best_epoch = epoch
-                patience_counter = 0
-                self.save_checkpoint(os.path.join(
-                    save_dir, 'best_model.pt'), epoch, optimizer, is_best=True)
-                print(
-                    f"  New best model saved! (Val Loss: {best_val_loss:.4f})")
-            else:
-                patience_counter += 1
-
-            # Save checkpoint at specified intervals (but not if it's already the best)
-            if (epoch + 1) % checkpoint_interval == 0 and epoch != best_epoch:
-                checkpoint_path = os.path.join(
-                    save_dir, f'checkpoint_epoch_{epoch+1}.pt')
-                self.save_checkpoint(checkpoint_path, epoch, optimizer)
-                print(f"  Checkpoint saved at epoch {epoch+1}")
-
-            # Early stopping
-            if patience_counter >= early_stopping_patience:
-                print(f"\nEarly stopping triggered after {epoch + 1} epochs")
-                break
-
-        # Final model is the best model (copy best to final for clarity)
-        best_path = os.path.join(save_dir, 'best_model.pt')
-        final_path = os.path.join(save_dir, 'final_model.pt')
-        if os.path.exists(best_path):
-            import shutil
-            shutil.copy2(best_path, final_path)
-            print(
-                f"Best model (epoch {best_epoch + 1}) copied to final_model.pt")
-
-        self.save_history(os.path.join(save_dir, 'training_history.json'))
 
     def evaluate_loss(self, data_loader):
         """Evaluate loss on a data loader"""
@@ -501,6 +436,7 @@ class MTLTrainer:
                 asr_lengths = batch['asr_lengths'].to(self.device)
                 prosody_targets = batch['prosody_targets'].to(self.device)
                 emotion_targets = batch['emotion_targets'].to(self.device)
+
                 if self.use_amp:
                     with autocast():
                         outputs = self.model(
@@ -544,7 +480,111 @@ class MTLTrainer:
 
         return losses
 
-    def save_checkpoint(self, path, epoch, optimizer, is_best=False):
+    def train(
+        self,
+        train_loader,
+        val_loader,
+        optimizer,
+        num_epochs,
+        scheduler=None,
+        save_dir='checkpoints',
+        early_stopping_patience=5,
+        checkpoint_interval=10
+    ):
+        """Complete training loop with improved checkpoint management"""
+        os.makedirs(save_dir, exist_ok=True)
+        best_val_loss = float('inf')
+        patience_counter = 0
+        best_epoch = 0
+
+        for epoch in range(num_epochs):
+            print(f"\nStarting epoch {epoch + 1}/{num_epochs}")
+
+            # Training
+            train_losses = self.train_epoch(train_loader, optimizer, scheduler)
+
+            # Validation
+            from train_mtl import MTLEvaluator  # Import here to avoid circular import
+            evaluator = MTLEvaluator(self.model, self.device, self.use_amp)
+            val_metrics = evaluator.evaluate(val_loader)
+
+            # Calculate validation loss
+            val_losses = self.evaluate_loss(val_loader)
+
+            # Log metrics
+            metrics = {
+                'epoch': epoch,
+                'train_total_loss': train_losses['total'],
+                'val_total_loss': val_losses['total']
+            }
+
+            for task in ['asr', 'prosody', 'emotion']:
+                if task in train_losses:
+                    metrics[f'train_{task}_loss'] = train_losses[task]
+                if task in val_losses:
+                    metrics[f'val_{task}_loss'] = val_losses[task]
+                if task in val_metrics:
+                    for metric_name, value in val_metrics[task].items():
+                        if metric_name != 'detailed_results':
+                            metrics[f'val_{task}_{metric_name}'] = value
+
+            if self.use_wandb:
+                wandb.log(metrics)
+
+            # Print epoch summary
+            print(f"\nEpoch {epoch + 1} Results:")
+            print(f"  Train Loss: {train_losses['total']:.4f}")
+            print(f"  Val Loss: {val_losses['total']:.4f}")
+            for task in ['asr', 'prosody', 'emotion']:
+                if task in val_metrics:
+                    print(f"  {task.capitalize()} Metrics:")
+                    for metric_name, value in val_metrics[task].items():
+                        if metric_name != 'detailed_results' and not isinstance(value, list):
+                            print(f"    {metric_name}: {value:.4f}")
+
+            # Save history
+            self.history['train_loss'].append(train_losses)
+            self.history['val_loss'].append(val_losses)
+            self.history['train_metrics'].append(metrics)
+            self.history['val_metrics'].append(val_metrics)
+
+            # Check for best model and save
+            if val_losses['total'] < best_val_loss:
+                best_val_loss = val_losses['total']
+                best_epoch = epoch
+                patience_counter = 0
+                self.save_checkpoint(os.path.join(
+                    save_dir, 'best_model.pt'), epoch, optimizer, scheduler, is_best=True)
+                print(
+                    f"  New best model saved! (Val Loss: {best_val_loss:.4f})")
+            else:
+                patience_counter += 1
+
+            # Save checkpoint at specified intervals
+            if (epoch + 1) % checkpoint_interval == 0 and epoch != best_epoch:
+                checkpoint_path = os.path.join(
+                    save_dir, f'checkpoint_epoch_{epoch+1}.pt')
+                self.save_checkpoint(
+                    checkpoint_path, epoch, optimizer, scheduler)
+                print(f"  Checkpoint saved at epoch {epoch+1}")
+
+            # Early stopping
+            if patience_counter >= early_stopping_patience:
+                print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                break
+
+        # Final model is the best model
+        best_path = os.path.join(save_dir, 'best_model.pt')
+        final_path = os.path.join(save_dir, 'final_model.pt')
+        if os.path.exists(best_path):
+            import shutil
+            shutil.copy2(best_path, final_path)
+            print(
+                f"Best model (epoch {best_epoch + 1}) copied to final_model.pt")
+
+        self.save_history(os.path.join(save_dir, 'training_history.json'))
+
+    def save_checkpoint(self, path, epoch, optimizer, scheduler=None, is_best=False):
         """Save complete checkpoint with optimizer state"""
         checkpoint = {
             'epoch': epoch,
@@ -552,11 +592,19 @@ class MTLTrainer:
             'optimizer_state_dict': optimizer.state_dict(),
             'config': self.model.config,
             'is_best': is_best,
-            'history': self.history
+            'history': self.history,
+            'gradient_accumulation_steps': self.gradient_accumulation_steps
         }
+
+        if scheduler is not None:
+            checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+
+        if self.use_amp and self.scaler is not None:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+
         torch.save(checkpoint, path)
 
-    def load_checkpoint(self, path, optimizer=None):
+    def load_checkpoint(self, path, optimizer=None, scheduler=None):
         """Load complete checkpoint"""
         try:
             checkpoint = torch.load(path, map_location=self.device)
@@ -572,39 +620,30 @@ class MTLTrainer:
         if optimizer is not None and 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
+        if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        if self.use_amp and 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
         if 'history' in checkpoint:
             self.history = checkpoint['history']
+
+        if 'gradient_accumulation_steps' in checkpoint:
+            self.gradient_accumulation_steps = checkpoint['gradient_accumulation_steps']
 
         return checkpoint.get('epoch', 0)
 
     def save_history(self, path):
         """Save training history"""
-        # Convert numpy types to Python types for JSON serialization
-        history_serializable = {}
-        for key, value in self.history.items():
-            if isinstance(value, list):
-                history_serializable[key] = []
-                for item in value:
-                    if isinstance(item, dict):
-                        serializable_item = {}
-                        for k, v in item.items():
-                            if isinstance(v, (np.integer, np.floating)):
-                                serializable_item[k] = float(v)
-                            else:
-                                serializable_item[k] = v
-                        history_serializable[key].append(serializable_item)
-                    else:
-                        history_serializable[key].append(item)
-            else:
-                history_serializable[key] = value
+        from train_mtl import NumpyEncoder  # Import the custom encoder
 
         with open(path, 'w', encoding='utf-8') as f:
-            json.dump(history_serializable, f, indent=4,
+            json.dump(self.history, f, indent=4,
                       ensure_ascii=False, cls=NumpyEncoder)
 
     def plot_training_history(self, save_path=None):
         """Plot training history"""
-        import matplotlib.pyplot as plt
 
         if len(self.history['train_loss']) == 0:
             print("No training history to plot")
@@ -677,124 +716,12 @@ def setup_tokenizer_and_dataset(dataset_dict, vocab_size=4000, model_prefix='aka
     return tokenizer
 
 
-def create_loaders(dataset_dict, config, batch_size, tokenizer, num_workers=2):
-    """Create memory efficient data loaders"""
-    train_dataset = MTLDataset(dataset_dict, split='train', config=config)
-    val_dataset = MTLDataset(dataset_dict, split='val', config=config)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
-        collate_fn=lambda batch: collate_fn_mtl(
-            batch, pad_token_id=tokenizer.pad_id)
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
-        collate_fn=lambda batch: collate_fn_mtl(
-            batch, pad_token_id=tokenizer.pad_id)
-    )
-
-    return train_loader, val_loader, train_dataset, val_dataset
-
-
-def create_test_loader(dataset_dict, config, batch_size, tokenizer, num_workers=2):
-    """Create test loader separately"""
-    test_dataset = MTLDataset(dataset_dict, split='test', config=config)
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
-        collate_fn=lambda batch: collate_fn_mtl(
-            batch, pad_token_id=tokenizer.pad_id)
-    )
-    return test_loader, test_dataset
-
-
-def cleanup_training_data(train_loader, val_loader, train_dataset, val_dataset):
-    """Clean up training data from memory"""
-    del train_loader, val_loader, train_dataset, val_dataset
-    gc.collect()
-    torch.cuda.empty_cache()
-    print("Training data cleaned from memory")
-
-
-def training_loop(
-    model, train_loader, val_loader, optimizer, num_epochs,
-    save_dir, device, use_wandb=False, use_amp=True
-):
-    """Memory efficient training loop"""
-
-    # Initialize trainer with memory optimizations
-    trainer = MTLTrainer(
-        model, device=device, use_wandb=use_wandb, use_amp=use_amp
-    )
-
-    # Enable gradient checkpointing if available
-    if hasattr(model, 'gradient_checkpointing_enable'):
-        model.gradient_checkpointing_enable()
-
-    # Train model
-    trainer.train(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        optimizer=optimizer,
-        num_epochs=num_epochs,
-        save_dir=save_dir
-    )
-
-    return trainer
-
-
-def test_evaluation(
-    model, dataset_dict, config, batch_size, tokenizer,
-    save_dir, device, use_amp=True
-):
-    """Memory efficient test evaluation"""
-
-    print("Loading test data...")
-    test_loader, test_dataset = create_test_loader(
-        dataset_dict, config, batch_size, tokenizer
-    )
-
-    # Load best model
-    trainer = MTLTrainer(model, device=device, use_amp=use_amp)
-    trainer.load_checkpoint(os.path.join(save_dir, 'best_model.pt'))
-
-    # Create memory efficient evaluator
-    evaluator = MTLEvaluator(model, device, use_amp=use_amp)
-
-    # Evaluate with detailed prediction tracking
-    test_metrics = evaluator.evaluate(test_loader)
-
-    # Clean up test data
-    del test_loader, test_dataset
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    return test_metrics
-
-
-def collate_fn_mtl(batch, pad_token_id=0):
-    """Custom collate function for MTL"""
+def collate_fn_mtl(batch, pad_token_id=0, tokenizer=None):
+    """Custom collate function for MTL with tokenization"""
     batch_size = len(batch)
 
     # Get maximum dimensions
     max_feature_len = max(item['input_features'].shape[-1] for item in batch)
-    max_asr_len = max(item['asr_length'].item() if torch.is_tensor(
-        item['asr_target']) else len(item['asr_target']) for item in batch)
     max_prosody_len = max(item['prosody_annotations'].shape[0]
                           for item in batch)
 
@@ -803,26 +730,39 @@ def collate_fn_mtl(batch, pad_token_id=0):
 
     # Initialize tensors
     input_features = torch.zeros(batch_size, n_mels, max_feature_len)
-    asr_targets = torch.full((batch_size, max_asr_len),
-                             pad_token_id, dtype=torch.long)
-    asr_lengths = torch.zeros(batch_size, dtype=torch.long)
     prosody_annotations = torch.zeros(batch_size, max_prosody_len)
     emotions = torch.zeros(batch_size, dtype=torch.long)
 
     words_batch = []
 
-    for i, item in enumerate(batch):
+    # Handle ASR tokenization if tokenizer is provided
+    if tokenizer is not None:
+        # Tokenize all words first to get max length
+        tokenized_words = []
+        for item in batch:
+            words = item['asr_target']  # This is still the words list
+            token_ids = tokenizer.encode_words(words, add_special_tokens=True)
+            tokenized_words.append(token_ids)
+
+        max_asr_len = max(len(tokens) for tokens in tokenized_words)
+        asr_targets = torch.full(
+            (batch_size, max_asr_len), pad_token_id, dtype=torch.long)
+        asr_lengths = torch.zeros(batch_size, dtype=torch.long)
+    else:
+        asr_targets = None
+        asr_lengths = None
+        tokenized_words = [None] * batch_size
+
+    for i, (item, tokens) in enumerate(zip(batch, tokenized_words)):
         # Input features
         feat_len = item['input_features'].shape[-1]
         input_features[i, :, :feat_len] = item['input_features']
 
-        # ASR targets
-        if torch.is_tensor(item['asr_target']):
-            asr_len = item['asr_target'].shape[0]
-            asr_targets[i, :asr_len] = item['asr_target']
+        # ASR targets (if tokenizer provided)
+        if tokenizer is not None and tokens is not None:
+            asr_len = len(tokens)
+            asr_targets[i, :asr_len] = torch.tensor(tokens, dtype=torch.long)
             asr_lengths[i] = asr_len
-        else:
-            asr_lengths[i] = len(item['asr_target'])
 
         # Prosody annotations
         prosody_len = item['prosody_annotations'].shape[0]
@@ -844,51 +784,6 @@ def collate_fn_mtl(batch, pad_token_id=0):
     }
 
 
-def plot_training_history(history, save_path=None):
-    """Plot training history"""
-    import matplotlib.pyplot as plt
-
-    if len(history['train_loss']) == 0:
-        print("No training history to plot")
-        return
-
-    plt.figure(figsize=(15, 10))
-
-    # Plot losses
-    plt.subplot(2, 1, 1)
-    epochs = range(len(history['train_loss']))
-    plt.plot(epochs, [x['total']
-             for x in history['train_loss']], label='Train Loss')
-    plt.plot(epochs, [x['total']
-             for x in history['val_loss']], label='Val Loss')
-    plt.title('Training and Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-
-    # Plot metrics
-    plt.subplot(2, 1, 2)
-    if len(history['val_metrics']) > 0:
-        for task in ['asr', 'prosody', 'emotion']:
-            if task in history['val_metrics'][0]:
-                metric_key = 'accuracy' if task != 'asr' else 'wer'
-                if metric_key in history['val_metrics'][0][task]:
-                    values = [x[task][metric_key]
-                              for x in history['val_metrics']]
-                    plt.plot(
-                        epochs, values, label=f'{task.capitalize()} {metric_key.upper()}')
-
-    plt.title('Validation Metrics')
-    plt.xlabel('Epoch')
-    plt.ylabel('Metric Value')
-    plt.legend()
-
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path)
-    plt.show()
-
-
 if __name__ == "__main__":
     import argparse
 
@@ -903,8 +798,6 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--use_amp", action="store_true", default=True,
                         help="Use automatic mixed precision training")
-    parser.add_argument("--num_workers", type=int, default=2,
-                        help="Number of data loader workers")
     parser.add_argument("--retrain_tokenizer", action="store_true",
                         help="Whether to retrain the tokenizer")
     parser.add_argument("--tokenizer_path", type=str,
@@ -918,18 +811,45 @@ if __name__ == "__main__":
                         help="Path to validation JSONL file")
     parser.add_argument("--test_jsonl", type=str, required=True,
                         help="Path to test JSONL file")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of gradient accumulation steps")
+    parser.add_argument("--scale_lr_with_accumulation", action="store_true",
+                        help="Scale learning rate with gradient accumulation")
+    parser.add_argument("--use_scheduler", action="store_true",
+                        help="Use cosine annealing learning rate scheduler")
     args = parser.parse_args()
+
+    # Calculate effective batch size
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
+    print(f"\nTraining Configuration:")
+    print(f"  Per-GPU batch size: {args.batch_size}")
+    print(f"  Gradient accumulation steps: {args.gradient_accumulation_steps}")
+    print(f"  Effective batch size: {effective_batch_size}")
+
+    base_lr = args.lr
+    if args.scale_lr_with_accumulation and args.gradient_accumulation_steps > 1:
+        # Square root scaling is more conservative and often works better
+        lr_scale = math.sqrt(args.gradient_accumulation_steps)
+        adjusted_lr = base_lr * lr_scale
+        print(f"  Base learning rate: {base_lr}")
+        print(f"  Adjusted learning rate: {adjusted_lr}")
+    else:
+        adjusted_lr = base_lr
+        print(f"  Learning rate: {adjusted_lr}")
 
     # Set device and optimize CUDA settings
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # Print initial memory usage
+    print_memory_usage("Initial memory usage:")
+
     if torch.cuda.is_available():
         # Optimize CUDA memory management
         torch.backends.cudnn.benchmark = True
         torch.cuda.empty_cache()
-        print(
-            f"GPU Memory before start: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+        # Reduce memory fragmentation
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
     # Initialize wandb if enabled
     if args.use_wandb:
@@ -951,19 +871,24 @@ if __name__ == "__main__":
 
     dataset_dict = load_dataset("json", data_files=data_files)
 
-    # Process audio paths for train and val only
+    # Process audio paths
     for split in ["train", "val", "test"]:
         dataset_dict[split] = dataset_dict[split].map(
-            lambda x: {"audio_filepath": os.path.join(
-                args.audio_base_path, x["audio_filepath"])}
+            lambda batch: {"audio_filepath": [os.path.join(
+                args.audio_base_path, path) for path in batch["audio_filepath"]]},
+            batched=True,
+            batch_size=500,
         )
+        # Cast to Audio - this doesn't load the audio, just sets up the column type
         dataset_dict[split] = dataset_dict[split].cast_column(
             "audio_filepath", Audio(sampling_rate=16000))
 
     print(f"Loaded train: {len(dataset_dict['train'])} samples")
     print(f"Loaded val: {len(dataset_dict['val'])} samples")
 
-    # Setup tokenizer (only using train/val data)
+    print_memory_usage("After dataset loading:")
+
+    # Setup tokenizer
     if args.retrain_tokenizer or args.tokenizer_path is None:
         print("Training new SentencePiece tokenizer...")
         tokenizer = setup_tokenizer_and_dataset(
@@ -1004,23 +929,54 @@ if __name__ == "__main__":
     print(f"Created MTL model with backbone: {args.backbone}")
     print(f"Active heads: {model.get_active_heads()}")
 
-    # Move model to device with memory optimization
+    # Apply memory optimizations
+    model = optimize_model_for_memory(model)
     model = model.to(device)
 
-    if torch.cuda.is_available():
-        print(
-            f"GPU Memory after model load: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+    print_memory_usage("After model creation:")
 
-    # Create memory efficient data loaders for training
-    train_loader, val_loader, train_dataset, val_dataset = create_loaders(
-        dataset_dict, config, args.batch_size, tokenizer, args.num_workers
+    # Create feature extractor to share across datasets
+
+    temp_backbone = BackboneModel(config.backbone_config)
+    feature_extractor = temp_backbone.feature_extractor
+    del temp_backbone
+    cleanup_memory()
+
+    # Create datasets with lazy loading
+    train_dataset = MTLDataset(
+        dataset_dict,
+        split='train',
+        config=config,
+        feature_extractor=feature_extractor
     )
 
-    print(f"Created data loaders with batch size: {args.batch_size}")
+    val_dataset = MTLDataset(
+        dataset_dict,
+        split='val',
+        config=config,
+        feature_extractor=feature_extractor
+    )
 
-    if torch.cuda.is_available():
-        print(
-            f"GPU Memory after data loaders: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+    # Create data loaders with memory-aware settings
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=lambda batch: collate_fn_mtl(
+            batch, pad_token_id=tokenizer.pad_id, tokenizer=tokenizer)
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=lambda batch: collate_fn_mtl(
+            batch, pad_token_id=tokenizer.pad_id, tokenizer=tokenizer)
+    )
+
+    print_memory_usage("After data loader creation:")
 
     # ============================================================================
     # PHASE 2: TRAIN MODEL
@@ -1029,110 +985,109 @@ if __name__ == "__main__":
     print("PHASE 2: TRAINING MODEL")
     print("="*50)
 
-    # Initialize optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=adjusted_lr,
+        weight_decay=0.01,
+        eps=1e-8,
+        betas=(0.9, 0.999)
+    )
 
-    # Train model with memory optimizations
-    trainer = training_loop(
-        model=model,
+    # Initialize scheduler if requested
+    scheduler = None
+    if args.use_scheduler:
+        # Calculate total training steps accounting for accumulation
+        steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
+        total_steps = steps_per_epoch * args.num_epochs
+
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps,
+            eta_min=1e-6
+        )
+        print(
+            f"  Using cosine annealing scheduler with {total_steps} total steps")
+
+    # Train with memory monitoring
+    trainer = MTLTrainer(
+        model,
+        device=device,
+        use_wandb=args.use_wandb,
+        use_amp=args.use_amp,
+        gradient_accumulation_steps=args.gradient_accumulation_steps
+    )
+
+    print("\nStarting training...")
+    trainer.train(
         train_loader=train_loader,
         val_loader=val_loader,
         optimizer=optimizer,
+        scheduler=scheduler,
         num_epochs=args.num_epochs,
         save_dir=args.save_dir,
-        device=device,
-        use_wandb=args.use_wandb,
-        use_amp=args.use_amp
+        early_stopping_patience=5,
+        checkpoint_interval=5
     )
 
+    print_memory_usage("After training:")
+
+    # Clean up training data before test evaluation
+    del train_dataset, val_dataset, train_loader, val_loader
+    cleanup_memory()
+
     # Plot training history
-    plot_training_history(trainer.history, os.path.join(
-        args.save_dir, 'training_history.png'))
+    trainer.plot_training_history(
+        os.path.join(args.save_dir, 'training_history.png')
+    )
 
     print("\nTraining completed!")
 
-    if torch.cuda.is_available():
-        print(
-            f"GPU Memory after training: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-
     # ============================================================================
-    # PHASE 3: CLEAN UP TRAINING DATA
+    # PHASE 3: LOAD TEST DATA AND EVALUATE
     # ============================================================================
     print("\n" + "="*50)
-    print("PHASE 3: CLEANING UP TRAINING DATA")
+    print("PHASE 3: LOADING TEST DATA AND EVALUATING")
     print("="*50)
 
-    # Clean up training data to free memory
-    cleanup_training_data(train_loader, val_loader, train_dataset, val_dataset)
-
-    # Also clean up the dataset_dict for train/val
-    del dataset_dict
-    del trainer  # Clean up trainer as well
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    if torch.cuda.is_available():
-        print(
-            f"GPU Memory after cleanup: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-
-    # ============================================================================
-    # PHASE 4: LOAD TEST DATA AND EVALUATE
-    # ============================================================================
-    print("\n" + "="*50)
-    print("PHASE 4: LOADING TEST DATA AND EVALUATING")
-    print("="*50)
-
-    # Now load test data separately
-    test_data_files = {"test": args.test_jsonl}
-    test_dataset_dict = load_dataset("json", data_files=test_data_files)
-
-    # Process test audio paths
-    test_dataset_dict["test"] = test_dataset_dict["test"].map(
-        lambda x: {"audio_filepath": os.path.join(
-            args.audio_base_path, x["audio_filepath"])}
-    )
-    test_dataset_dict["test"] = test_dataset_dict["test"].cast_column(
-        "audio_filepath", Audio(sampling_rate=16000))
-
-    print(f"Loaded test: {len(test_dataset_dict['test'])} samples")
-
-    if torch.cuda.is_available():
-        print(
-            f"GPU Memory after test data load: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-
-    # Evaluate on test set with memory efficiency
-    test_metrics = test_evaluation(
-        model=model,
-        dataset_dict=test_dataset_dict,
+    test_dataset = MTLDataset(
+        dataset_dict,
+        split='test',
         config=config,
-        batch_size=args.batch_size,
-        tokenizer=tokenizer,
-        save_dir=args.save_dir,
-        device=device,
-        use_amp=args.use_amp
+        feature_extractor=feature_extractor
     )
 
-    # Print detailed results
-    evaluator = MTLEvaluator(
-        model, device, use_amp=args.use_amp)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=lambda batch: collate_fn_mtl(
+            batch, pad_token_id=tokenizer.pad_id, tokenizer=tokenizer)
+    )
+
+    # Evaluate on test set
+    print("\nEvaluating on test set...")
+    evaluator = MTLEvaluator(model, device, use_amp=args.use_amp)
+    test_metrics = evaluator.evaluate(test_loader)
     evaluator.print_detailed_results(test_metrics)
 
-    # Save test results
-    with open(os.path.join(args.save_dir, 'test_results.json'), 'w', encoding='utf-8') as f:
-        json.dump(test_metrics, f, indent=4,
-                  ensure_ascii=False, cls=NumpyEncoder)
+    # Save results
+    with open(os.path.join(args.save_dir, 'test_results.json'), 'w') as f:
+        json.dump(test_metrics, f, indent=4, cls=NumpyEncoder)
 
-    # Final cleanup
-    del test_dataset_dict, model, tokenizer
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    if torch.cuda.is_available():
-        print(f"Final GPU Memory: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+    print_memory_usage("Final memory usage:")
 
     print("\n" + "="*50)
     print("EVALUATION COMPLETED!")
     print("="*50)
 
     if args.use_wandb:
-        wandb.finish()
+
+        wandb.config.update({
+            "effective_batch_size": effective_batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "per_gpu_batch_size": args.batch_size,
+            "learning_rate": adjusted_lr,
+            "base_learning_rate": base_lr,
+            "use_scheduler": args.use_scheduler
+        })

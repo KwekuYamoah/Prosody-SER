@@ -37,12 +37,12 @@ BACKBONE_CONFIGS = {
     ),
     "xlsr": BackboneConfig(
         model_name="xlsr",
-        pretrained_model_name="facebook/wav2vec2-large-xlsr-53",
+        pretrained_model_name="facebook/wav2vec2-xls-r-300m",
         hidden_size=1024,
     ),
     "mms": BackboneConfig(
         model_name="mms",
-        pretrained_model_name="facebook/mms-1b-all",
+        pretrained_model_name="facebook/mms-300m",
         hidden_size=1024,
     ),
     "wav2vec2-bert": BackboneConfig(
@@ -71,17 +71,42 @@ class BackboneModel(nn.Module):
 
     def _load_model(self) -> nn.Module:
         """Load the appropriate model based on configuration"""
-        if self.config.model_name == "whisper":
-            return WhisperModel.from_pretrained(self.config.pretrained_model_name)
-        elif self.config.model_name == "xlsr":
-            return Wav2Vec2Model.from_pretrained(self.config.pretrained_model_name)
-        elif self.config.model_name == "mms":
-            return Wav2Vec2Model.from_pretrained(self.config.pretrained_model_name)
-        elif self.config.model_name == "wav2vec2-bert":
-            return Wav2Vec2BertModel.from_pretrained(self.config.pretrained_model_name)
-        else:
-            raise ValueError(
-                f"Unsupported model name: {self.config.model_name}")
+        # Common kwargs to prefer safetensors format
+        load_kwargs = {
+            "use_safetensors": True,  # Prefer safetensors format
+            "trust_remote_code": False,  # Security best practice
+        }
+
+        try:
+            if self.config.model_name == "whisper":
+                return WhisperModel.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
+            elif self.config.model_name == "xlsr":
+                return Wav2Vec2Model.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
+            elif self.config.model_name == "mms":
+                return Wav2Vec2Model.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
+            elif self.config.model_name == "wav2vec2-bert":
+                return Wav2Vec2BertModel.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
+            else:
+                raise ValueError(
+                    f"Unsupported model name: {self.config.model_name}")
+        except Exception as e:
+            if "safetensors" in str(e):
+                # If safetensors not available, try without it but warn the user
+                print(f"Warning: SafeTensors format not available for {self.config.pretrained_model_name}. "
+                      f"Consider upgrading torch to >=2.6 or using a different model.")
+                # Remove use_safetensors and retry
+                load_kwargs.pop("use_safetensors", None)
+
+                if self.config.model_name == "whisper":
+                    return WhisperModel.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
+                elif self.config.model_name == "xlsr":
+                    return Wav2Vec2Model.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
+                elif self.config.model_name == "mms":
+                    return Wav2Vec2Model.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
+                elif self.config.model_name == "wav2vec2-bert":
+                    return Wav2Vec2BertModel.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
+            else:
+                raise e
 
     def _load_feature_extractor(self):
         """Load the appropriate feature extractor"""
