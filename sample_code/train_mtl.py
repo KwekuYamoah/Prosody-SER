@@ -56,15 +56,22 @@ class MTLEvaluator:
 
     def compute_asr_metrics(self, predictions: List, targets: List) -> Dict:
         """
-        FIX: Compute ASR metrics (WER and CER) using the tokenizer.
-        The previous implementation was incorrect. This version properly decodes
-        token IDs into text before comparing them.
+        Compute ASR metrics (WER and CER) using the tokenizer.
         """
         # Decode predicted token IDs into text
         pred_texts = []
         for pred_ids in predictions:
-            # The tokenizer's decode method handles the conversion from IDs to string
-            pred_texts.append(self.tokenizer.decode(pred_ids))
+            # Filter consecutive duplicates (CTC decoding)
+            filtered_pred = []
+            prev_id = None
+            for id in pred_ids:
+                if id != prev_id and id != 0:  # Skip blanks and duplicates
+                    filtered_pred.append(id)
+                prev_id = id
+
+            # Decode the filtered predictions
+            pred_texts.append(self.tokenizer.decode(
+                filtered_pred, skip_special_tokens=True))
 
         # Decode target token IDs into text
         target_texts = []
@@ -72,15 +79,21 @@ class MTLEvaluator:
             # Filter out padding tokens before decoding targets
             filtered_ids = [id for id in target_ids if id !=
                             self.tokenizer.pad_id]
-            target_texts.append(self.tokenizer.decode(filtered_ids))
+            target_texts.append(self.tokenizer.decode(
+                filtered_ids, skip_special_tokens=True))
+
+        # Debug print for first few examples
+        for i in range(min(3, len(pred_texts))):
+            print(
+                f"Debug - Target: '{target_texts[i]}', Predicted: '{pred_texts[i]}'")
 
         detailed_results = [
             {"predicted": p, "target": t} for p, t in zip(pred_texts, target_texts)
         ]
 
         # Calculate WER and CER on the decoded text
-        wer_score = wer(target_texts, pred_texts)
-        cer_score = cer(target_texts, pred_texts)
+        wer_score = wer(target_texts, pred_texts) if pred_texts else 1.0
+        cer_score = cer(target_texts, pred_texts) if pred_texts else 1.0
 
         return {
             "wer": wer_score,
@@ -139,7 +152,7 @@ class MTLEvaluator:
         return self._calculate_metrics(all_predictions, all_targets, detailed_results)
 
     def _process_batch_predictions(self, outputs, batch, all_predictions, all_targets, detailed_results):
-        """Process batch predictions efficiently"""
+        """Process batch predictions efficiently with detailed results"""
         if 'asr_logits' in outputs and batch['asr_targets'] is not None:
             asr_preds = outputs['asr_logits'].argmax(dim=-1).cpu().tolist()
             asr_targets = batch['asr_targets'].cpu().tolist()
@@ -151,7 +164,15 @@ class MTLEvaluator:
             prosody_targets = batch['prosody_targets'].cpu()
             all_predictions['prosody'].extend(prosody_preds.numpy())
             all_targets['prosody'].extend(prosody_targets.numpy())
-            # Detailed prosody results can be added here if needed
+
+            # Add detailed results for prosody
+            for i in range(len(prosody_preds)):
+                if 'words' in batch and i < len(batch['words']):
+                    detailed_results['prosody'].append({
+                        'words': batch['words'][i],
+                        'predicted': prosody_preds[i].numpy().tolist(),
+                        'target': prosody_targets[i].numpy().tolist()
+                    })
 
         if 'emotion_logits' in outputs:
             emotion_preds = outputs['emotion_logits'].argmax(
@@ -160,8 +181,17 @@ class MTLEvaluator:
             all_predictions['emotion'].extend(emotion_preds)
             all_targets['emotion'].extend(emotion_targets)
 
+            # Add detailed results for emotion
+            emotion_labels = ['anger', 'contempt', 'disgust', 'fear',
+                              'guilt', 'happy', 'sadness', 'shame', 'surprise']
+            for i in range(len(emotion_preds)):
+                detailed_results['emotion'].append({
+                    'predicted': emotion_labels[emotion_preds[i]] if emotion_preds[i] < len(emotion_labels) else f"class_{emotion_preds[i]}",
+                    'target': emotion_labels[emotion_targets[i]] if emotion_targets[i] < len(emotion_labels) else f"class_{emotion_targets[i]}"
+                })
+
     def _calculate_metrics(self, all_predictions, all_targets, detailed_results):
-        """Calculate metrics for all tasks"""
+        """Calculate metrics for all tasks with detailed results"""
         metrics = {}
         for task in ['asr', 'prosody', 'emotion']:
             if not all_predictions[task]:
@@ -177,25 +207,35 @@ class MTLEvaluator:
                     metrics[task] = {
                         'accuracy': accuracy_score(flat_targets, flat_preds),
                         'f1': f1_score(flat_targets, flat_preds, average='weighted', zero_division=0),
+                        # Keep first 5 examples
+                        'detailed_results': detailed_results['prosody'][:5]
                     }
             elif task == 'emotion':
                 metrics[task] = {
                     'accuracy': accuracy_score(all_targets['emotion'], all_predictions['emotion']),
                     'f1': f1_score(all_targets['emotion'], all_predictions['emotion'], average='weighted', zero_division=0),
+                    # Keep first 5 examples
+                    'detailed_results': detailed_results['emotion'][:5]
                 }
         return metrics
 
     def print_detailed_results(self, metrics):
-        """Print detailed results for each task"""
+        """Print detailed results for each task - FIXED VERSION"""
         print("\nDetailed Evaluation Results:")
 
         for task in ['asr', 'prosody', 'emotion']:
-            if task in metrics:
-                print(f"\n{task.upper()} Results:")
-                for metric_name, value in metrics[task].items():
-                    if metric_name != 'detailed_results':
-                        print(f"{metric_name}: {value:.4f}")
+            if task not in metrics:
+                continue
 
+            print(f"\n{task.upper()} Results:")
+
+            # Print metrics
+            for metric_name, value in metrics[task].items():
+                if metric_name != 'detailed_results' and not isinstance(value, list):
+                    print(f"{metric_name}: {value:.4f}")
+
+            # Print sample predictions if available
+            if 'detailed_results' in metrics[task] and metrics[task]['detailed_results']:
                 print("\nSample Predictions:")
                 for i, result in enumerate(metrics[task]['detailed_results'][:5]):
                     print(f"\nExample {i+1}:")
@@ -203,7 +243,8 @@ class MTLEvaluator:
                         print(f"Target: {result['target']}")
                         print(f"Predicted: {result['predicted']}")
                     elif task == 'prosody':
-                        print("Words:", " ".join(result['words']))
+                        if 'words' in result:
+                            print("Words:", " ".join(result['words']))
                         print("Target Prominence:", " ".join(
                             map(str, result['target'])))
                         print("Predicted Prominence:", " ".join(
@@ -211,6 +252,8 @@ class MTLEvaluator:
                     else:  # emotion
                         print(f"Target Emotion: {result['target']}")
                         print(f"Predicted Emotion: {result['predicted']}")
+            else:
+                print("\nNo detailed results available for this task.")
 
 
 class MTLTrainer:
@@ -293,7 +336,7 @@ class MTLTrainer:
 
                     # Clip gradients to prevent exploding gradients
                     torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), max_norm=1.0)
+                        self.model.parameters(), max_norm=0.5)
 
                     # Step optimizer
                     self.scaler.step(optimizer)
@@ -633,87 +676,6 @@ def setup_tokenizer_and_dataset(dataset_dict, vocab_size=4000, model_prefix='aka
     return tokenizer
 
 
-# def collate_fn_mtl(batch: List[Dict], pad_token_id: int = 0, tokenizer=None, backbone_name: str = "whisper") -> Dict:
-#     """
-#     Custom collate function for MTL.
-#     CRITICAL FIX: Properly handle different backbone input shapes.
-#     """
-#     batch_size = len(batch)
-
-#     # Handle input features based on backbone type
-#     if backbone_name in ["whisper", "wav2vec2-bert"]:
-#         # Whisper: input shape is (n_mels, time) for each sample
-#         # Find max time dimension
-#         max_time = max(item['input_features'].shape[1] for item in batch)
-#         n_mels = batch[0]['input_features'].shape[0]
-
-#         # Create padded tensor: (batch, n_mels, time)
-#         input_features = torch.zeros(batch_size, n_mels, max_time)
-
-#         for i, item in enumerate(batch):
-#             time_len = item['input_features'].shape[1]
-#             input_features[i, :, :time_len] = item['input_features']
-
-#     elif backbone_name in ["xlsr", "mms"]:
-#         # Wav2Vec2: input shape is (time,) for each sample - 1D audio
-#         # Find max length
-#         max_len = max(item['input_features'].shape[0] for item in batch)
-
-#         # Create padded tensor: (batch, time)
-#         input_features = torch.zeros(batch_size, max_len)
-
-#         for i, item in enumerate(batch):
-#             feat = item['input_features']
-#             # Ensure it's 1D
-#             if feat.ndim > 1:
-#                 feat = feat.flatten()
-#             length = feat.shape[0]
-#             input_features[i, :length] = feat
-#     else:
-#         raise ValueError(f"Unknown backbone: {backbone_name}")
-
-#     # Pad prosody targets
-#     max_prosody_len = max(item['prosody_targets'].shape[0] for item in batch)
-#     prosody_targets = torch.zeros(batch_size, max_prosody_len)
-
-#     for i, item in enumerate(batch):
-#         prosody_len = item['prosody_targets'].shape[0]
-#         prosody_targets[i, :prosody_len] = item['prosody_targets']
-
-#     # Stack emotion targets
-#     emotion_targets = torch.tensor(
-#         [item['emotion_targets'] for item in batch], dtype=torch.long
-#     )
-
-#     # Collect words
-#     words_batch = [item['words'] for item in batch]
-
-#     # Tokenize and pad ASR targets
-#     if tokenizer:
-#         tokenized_ids = []
-#         for item in batch:
-#             text_to_encode = " ".join(item['asr_target'])
-#             ids = tokenizer.encode(text_to_encode, add_special_tokens=True)
-#             tokenized_ids.append(torch.tensor(ids, dtype=torch.long))
-
-#         # Pad sequences
-#         asr_targets = torch.nn.utils.rnn.pad_sequence(
-#             tokenized_ids, batch_first=True, padding_value=pad_token_id
-#         )
-#         asr_lengths = torch.tensor([len(ids)
-#                                    for ids in tokenized_ids], dtype=torch.long)
-#     else:
-#         asr_targets, asr_lengths = None, None
-
-#     return {
-#         'input_features': input_features,
-#         'words': words_batch,
-#         'asr_targets': asr_targets,
-#         'asr_lengths': asr_lengths,
-#         'prosody_targets': prosody_targets,
-#         'emotion_targets': emotion_targets
-#     }
-
 def collate_fn_mtl(batch: List[Dict], pad_token_id: int = 0, tokenizer=None, backbone_name: str = "whisper") -> Dict:
     """
     Custom collate function for MTL.
@@ -790,6 +752,7 @@ def collate_fn_mtl(batch: List[Dict], pad_token_id: int = 0, tokenizer=None, bac
         'emotion_targets': emotion_targets
     }
 
+
 def configure_cuda_memory():
     """Configure CUDA for optimal memory usage"""
     if torch.cuda.is_available():
@@ -797,6 +760,7 @@ def configure_cuda_memory():
         # Allow TF32 for better performance
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+
 
 if __name__ == "__main__":
     import argparse
@@ -907,15 +871,20 @@ if __name__ == "__main__":
         print("Training new SentencePiece tokenizer...")
         tokenizer = setup_tokenizer_and_dataset(
             dataset_dict, vocab_size=args.vocab_size)
-        if args.tokenizer_path:
-            tokenizer.model_path = args.tokenizer_path
-            tokenizer.sp.save(args.tokenizer_path)
     else:
-        print(f"Loading existing tokenizer from {args.tokenizer_path}")
+        print(f"\nLoading existing tokenizer from {args.tokenizer_path}")
         tokenizer = SentencePieceTokenizer(model_path=args.tokenizer_path)
         tokenizer.load_tokenizer()
 
-    print(f"Tokenizer vocabulary size: {tokenizer.get_vocab_size()}")
+    # Test tokenizer
+    text = "hello world test"
+    ids = tokenizer.encode(text)
+    decoded = tokenizer.decode(ids)
+
+    print(f"\nTokenizer vocabulary size: {tokenizer.get_vocab_size()}")
+    print(f"Tokenizer blank ID: {tokenizer.blank_id}")
+    print(f"Sample encoding test: {ids}")
+    print(f"Sample decode test: {decoded}\n")
 
     # Create config
     config = MTLConfig(
@@ -924,9 +893,9 @@ if __name__ == "__main__":
         emotion_classes=9,
         prosody_classes=2,
         loss_weights={
-            'asr': 1.0,
-            'prosody': 0.5,
-            'ser': 0.5
+            'asr': 0.3,
+            'prosody': 0.3,
+            'ser': 0.4
         },
 
     )
@@ -940,7 +909,7 @@ if __name__ == "__main__":
         tokenizer=tokenizer
     ).to(device)
 
-    print(f"Created MTL model with backbone: {args.backbone}")
+    print(f"\nCreated MTL model with backbone: {args.backbone}")
     print(f"Active heads: {model.get_active_heads()}")
 
     # Apply memory optimizations
@@ -1094,12 +1063,14 @@ if __name__ == "__main__":
 
     # Evaluate on test set
     print("\nEvaluating on test set...")
+    # Load best model and evaluate on test set
+    trainer.load_checkpoint(os.path.join(args.save_dir, 'best_model.pt'))
     evaluator = MTLEvaluator(model, tokenizer, device, use_amp=args.use_amp)
     test_metrics = evaluator.evaluate(test_loader)
     evaluator.print_detailed_results(test_metrics)
 
     # Save results
-    with open(os.path.join(args.save_dir, 'test_results.json'), 'w') as f:
+    with open(os.path.join(args.save_dir, 'test_results.json'), 'w', encoding='utf-8') as f:
         json.dump(test_metrics, f, indent=4, cls=NumpyEncoder)
 
     print_memory_usage("Final memory usage:")

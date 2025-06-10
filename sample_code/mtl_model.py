@@ -82,8 +82,11 @@ class MTLModel(nn.Module):
     def _initialize_loss_functions(self):
         """Initialize loss functions for each task"""
         if self.use_asr:
-            blank_id = self.tokenizer.blank_id if self.tokenizer else 0
-            self.ctc_loss = nn.CTCLoss(blank=blank_id, zero_infinity=True)
+            # CRITICAL: Use 0 as blank_id for standard CTC
+            blank_id = 0  # Don't use tokenizer.blank_id if it's not 0
+            self.ctc_loss = nn.CTCLoss(
+                blank=blank_id, zero_infinity=True, reduction='mean')
+            print(f"CTC Loss initialized with blank_id={blank_id}")
 
         if self.use_prosody:
             if self.config.prosody_classes == 2:
