@@ -62,7 +62,7 @@ class CTCDecoder:
 
        for b in range(batch_size):
         seq_len = lengths[b] if lengths is not None else logits.shape[1]
-        single_logits = logits[b, :seq_len].cput() # (time, vocab)
+        single_logits = logits[b, :seq_len].cpu() # (time, vocab)
 
         # apply log_softmax for stability
         log_probs = F.log_softmax(single_logits, dim=-1).numpy()

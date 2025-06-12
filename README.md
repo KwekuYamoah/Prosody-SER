@@ -56,18 +56,21 @@ The system expects your dataset to be organized in the following format:
 The training script supports various command-line arguments for customization:
 
 ```bash
-python sample_code/train_mtl.py \
-    --audio_base_path "/path/to/audio/files/" \
-    --train_jsonl "/path/to/train.jsonl" \
-    --val_jsonl "/path/to/val.jsonl" \
-    --test_jsonl "/path/to/test.jsonl" \
+python -m sample_code.scripts.train \
+    --audio_base_path "./AUDIO/" \
+    --train_jsonl "./json_data/ser_audio_features_wav_train.jsonl" \
+    --val_jsonl "./json_data/ser_audio_features_wav_train.jsonl" \
+    --test_jsonl "./json_data/ser_audio_features_wav_test.jsonl" \
     --backbone whisper \
-    --batch_size 8 \
-    --vocab_size 4000 \
-    --num_epochs 10 \
+    --batch_size 2 \
+    --vocab_size 16000 \
+    --num_epochs 6 \
     --lr 1e-4 \
     --save_dir "checkpoints" \
-    --use_wandb
+    --tokenizer_path "akan_mtl_tokenizer.model" \
+    --gradient_accumulation_steps 8 \
+    --use_amp \
+    --use_enhanced_training
 ```
 
 #### Command-line Arguments
@@ -83,7 +86,50 @@ python sample_code/train_mtl.py \
 - `--num_epochs`: Number of training epochs (default: 10)
 - `--lr`: Learning rate (default: 1e-4)
 - `--save_dir`: Directory to save checkpoints (default: "checkpoints")
+- `--tokenizer_path`: Path to trained tokenizer (required)
+- `--gradient_accumulation_steps`: Number of gradient accumulation steps (default: 1)
+- `--use_amp`: Enable automatic mixed precision training (default: True)
+- `--use_enhanced_training`: Enable enhanced training with freeze/unfreeze strategy (default: True)
+- `--freeze_encoder_initially`: Whether to freeze encoder initially (default: True)
+- `--unfreeze_epoch_ratio`: Fraction of epochs to train with frozen encoder (default: 0.5)
+- `--lr_reduction_factor`: Factor to reduce LR when unfreezing (default: 0.1)
+- `--asr_lr_multiplier`: Learning rate multiplier for ASR head (default: 0.1)
+- `--ctc_entropy_weight`: Entropy regularization weight for CTC (default: 0.01)
+- `--ctc_blank_weight`: Maximum blank probability for CTC (default: 0.95)
 - `--use_wandb`: Enable Wandb logging (optional flag)
+- `--use_scheduler`: Use cosine annealing learning rate scheduler (optional flag)
+- `--scale_lr_with_accumulation`: Scale learning rate with gradient accumulation (optional flag)
+
+### Evaluation
+
+To evaluate a trained model:
+
+```bash
+python -m sample_code.scripts.evaluate \
+    --checkpoint_path "checkpoints/best_model.pt" \
+    --tokenizer_path "akan_mtl_tokenizer.model" \
+    --audio_base_path "./AUDIO/" \
+    --test_jsonl "./json_data/ser_audio_features_wav_test.jsonl" \
+    --decode_method beam \
+    --output_dir "eval_results"
+```
+
+#### Evaluation Arguments
+
+- `--checkpoint_path`: Path to model checkpoint (required)
+- `--tokenizer_path`: Path to trained tokenizer (required)
+- `--audio_base_path`: Base path to audio files directory (required)
+- `--test_jsonl`: Path to test JSONL file (required)
+- `--batch_size`: Batch size for evaluation (default: 8)
+- `--decode_method`: Decoding method for ASR (default: "beam", choices: ["greedy", "beam"])
+- `--output_dir`: Directory to save evaluation results (default: "eval_results")
+- `--use_amp`: Use automatic mixed precision (default: True)
+- `--device`: Device to use for evaluation (default: "cuda", choices: ["cuda", "cpu"])
+
+The evaluation script will generate:
+1. A JSON file with detailed metrics (`test_metrics.json`)
+2. The evaluation configuration (`eval_config.json`)
+3. A summary report (`summary.txt`)
 
 ### Example Usage
 
