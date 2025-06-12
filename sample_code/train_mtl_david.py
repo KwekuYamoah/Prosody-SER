@@ -11,11 +11,11 @@ import wandb  # for experiment tracking
 from jiwer import wer, cer  # for ASR metrics
 from datasets import load_dataset, Audio  # Add datasets import
 
-from mtl_config import MTLConfig
-from mtl_model import MTLModel
-from mtl_dataset import MTLDataset
-from backbone_models import BACKBONE_CONFIGS
-from tokenizer import SentencePieceTokenizer
+from sample_code.scripts.mtl_config import MTLConfig
+from sample_code.scripts.mtl_model import MTLModel
+from sample_code.scripts.mtl_dataset import MTLDataset
+from sample_code.scripts.backbone_models import BACKBONE_CONFIGS
+from sample_code.scripts.tokenizer import SentencePieceTokenizer
 
 # Add MTLConfig to safe globals for model loading
 torch.serialization.add_safe_globals([MTLConfig])

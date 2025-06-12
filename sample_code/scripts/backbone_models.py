@@ -62,8 +62,11 @@ class BackboneModel(nn.Module):
         self.model = self._load_model()
         self.feature_extractor = self._load_feature_extractor()
 
+        # Track freeze state
+        self._is_frozen = False
+
         if config.freeze_encoder:
-            self._freeze_encoder()
+            self.freeze_encoder()
 
     def get_hidden_size(self) -> int:
         """Get the hidden size of the backbone model"""
@@ -112,11 +115,32 @@ class BackboneModel(nn.Module):
         """Load the appropriate feature extractor"""
         return AutoFeatureExtractor.from_pretrained(self.config.pretrained_model_name)
 
-    def _freeze_encoder(self):
+    def freeze_encoder(self):
         """Freeze the encoder parameters"""
+        print("Freezing encoder parameters...")
+        self._is_frozen = True
         for param in self.model.parameters():
             param.requires_grad = False
+    
+    def unfreeze_encoder(self):
+        """Unfreeze all encoder parameters"""
+        print("Unfreezing encoder parameters...")
+        self._is_frozen = False
+        for param in self.model.parameters():
+            param.requires_grad = True
 
+    def is_frozen(self) -> bool:
+        """Check if encoder is frozen"""
+        return self._is_frozen
+
+    def get_num_trainable_params(self) -> int:
+        """Get number of trainable parameters"""
+        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+    def get_num_total_params(self) -> int:
+        """Get total number of parameters"""
+        return sum(p.numel() for p in self.model.parameters())
+    
     def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         """Forward pass through the backbone model"""
         if self.config.model_name == "whisper":

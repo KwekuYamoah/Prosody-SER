@@ -4,12 +4,13 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
 import warnings
 
-from backbone_models import BackboneModel
-from mtl_config import MTLConfig
+from sample_code.scripts.backbone_models import BackboneModel
+from sample_code.scripts.mtl_config import MTLConfig
+from sample_code.scripts.ctc_decoder import CTCLossWithRegularization
 
 
 class MTLModel(nn.Module):
-    """Multi-task learning model with configurable backbone"""
+    """Multi-task learning model with configurable backbone and improved CTC handling"""
 
     def __init__(
         self,
@@ -43,11 +44,17 @@ class MTLModel(nn.Module):
 
     def _initialize_heads(self):
         """Initialize task-specific heads based on configuration"""
-        # ASR head
+        # ASR head with layer normalization for stability
         if self.use_asr:
             vocab_size = self.tokenizer.get_vocab_size(
             ) if self.tokenizer else self.config.vocab_size
+            self.asr_layer_norm = nn.LayerNorm(self.hidden_size)
             self.asr_head = nn.Linear(self.hidden_size, vocab_size)
+
+            # Initialize ASR head with smaller weights to prevent collapse
+            nn.init.xavier_uniform_(self.asr_head.weight, gain=0.1)
+            nn.init.constant_(self.asr_head.bias, 0)
+
             print(f"ASR head initialized with vocab size: {vocab_size}")
 
         # Prosody head
@@ -82,11 +89,16 @@ class MTLModel(nn.Module):
     def _initialize_loss_functions(self):
         """Initialize loss functions for each task"""
         if self.use_asr:
-            # CRITICAL: Use 0 as blank_id for standard CTC
-            blank_id = 0  # Don't use tokenizer.blank_id if it's not 0
-            self.ctc_loss = nn.CTCLoss(
-                blank=blank_id, zero_infinity=True, reduction='mean')
-            print(f"CTC Loss initialized with blank_id={blank_id}")
+            # Use improved CTC loss with regularization
+            blank_id = 0  # Standard CTC blank token
+            self.ctc_loss = CTCLossWithRegularization(
+                blank_id=blank_id,
+                zero_infinity=True,
+                entropy_weight=0.01,  # Prevent overconfidence
+                blank_weight=0.95     # Prevent excessive blank predictions
+            )
+            print(
+                f"CTC Loss initialized with blank_id={blank_id} and regularization")
 
         if self.use_prosody:
             if self.config.prosody_classes == 2:
@@ -120,7 +132,6 @@ class MTLModel(nn.Module):
             )
         else:
             # Use fixed avg_pool1d instead of adaptive
-            # Calculate kernel size and stride for desired output length
             kernel_size = T // target_length
             stride = kernel_size
 
@@ -129,7 +140,6 @@ class MTLModel(nn.Module):
             expected_out = (T - kernel_size + 2 * padding) // stride + 1
 
             if expected_out < target_length:
-                # Need to adjust kernel or stride
                 kernel_size = max(1, kernel_size - 1)
                 stride = kernel_size
 
@@ -165,28 +175,31 @@ class MTLModel(nn.Module):
 
         outputs = {}
         total_loss = 0.0
+        loss_details = {}
 
-        # ASR forward pass
-        if self.use_asr and self.asr_head is not None:
-            asr_logits = self.asr_head(backbone_features)
-            asr_log_probs = F.log_softmax(asr_logits, dim=-1)
+        # ASR forward pass with layer norm for stability
+        if self.use_asr and hasattr(self, 'asr_head'):
+            # Apply layer normalization before ASR head
+            asr_features = self.asr_layer_norm(backbone_features)
+            asr_logits = self.asr_head(asr_features)
+
+            # Don't apply log_softmax here - let the loss function handle it
             outputs['asr_logits'] = asr_logits
-            outputs['asr_log_probs'] = asr_log_probs
 
             if return_loss and asr_targets is not None:
-                asr_loss = self._compute_asr_loss(
-                    asr_log_probs, asr_targets, asr_lengths)
+                asr_loss, asr_loss_details = self._compute_asr_loss(
+                    asr_logits, asr_targets, asr_lengths)
                 outputs['asr_loss'] = asr_loss
+                loss_details['asr'] = asr_loss_details
                 total_loss += self.config.loss_weights['asr'] * asr_loss
 
         # Prosody forward pass with CUDA fix
-        if self.use_prosody and self.prosody_head is not None:
+        if self.use_prosody and hasattr(self, 'prosody_head'):
             B, T, D = backbone_features.shape
             prosody_target_len = prosody_targets.shape[1] if prosody_targets is not None else 0
 
             # Safeguard against zero-length inputs or targets
             if T <= 1 or prosody_target_len <= 1:
-                # If features or targets are too short, create zero logits
                 if self.config.prosody_classes == 2:
                     prosody_logits = torch.zeros(
                         B, prosody_target_len, device=backbone_features.device)
@@ -194,7 +207,7 @@ class MTLModel(nn.Module):
                     prosody_logits = torch.zeros(
                         B, prosody_target_len, self.config.prosody_classes, device=backbone_features.device)
             else:
-                # Always use the safe pooling method that avoids adaptive pooling
+                # Always use the safe pooling method
                 pooled_features = self._adaptive_pool_workaround(
                     backbone_features, prosody_target_len)
 
@@ -225,7 +238,7 @@ class MTLModel(nn.Module):
                     prosody_loss
 
         # SER forward pass
-        if self.use_ser and self.ser_head is not None:
+        if self.use_ser and hasattr(self, 'ser_head'):
             # Global average pooling
             ser_features = torch.mean(backbone_features, dim=1)
             emotion_logits = self.ser_head(ser_features)
@@ -239,21 +252,30 @@ class MTLModel(nn.Module):
 
         if return_loss:
             outputs['total_loss'] = total_loss
+            outputs['loss_details'] = loss_details
 
         return outputs
 
-    def _compute_asr_loss(self, log_probs, targets, lengths):
-        """Compute CTC loss for ASR"""
+    def _compute_asr_loss(self, logits, targets, lengths):
+        """Compute CTC loss for ASR with improved handling"""
         max_target_value = self.tokenizer.get_vocab_size(
         ) - 1 if self.tokenizer else self.config.vocab_size - 1
         if targets.max() > max_target_value or targets.min() < 0:
             raise ValueError(
-                f"ASR target values are out of bounds. Max target: {targets.max()}, Min target: {targets.min()}, Max allowed: {max_target_value}")
+                f"ASR target values are out of bounds. Max target: {targets.max()}, "
+                f"Min target: {targets.min()}, Max allowed: {max_target_value}")
 
+        # Apply log_softmax for CTC loss
+        log_probs = F.log_softmax(logits, dim=-1)
+
+        # Transpose for CTC loss: (T, N, C)
         log_probs = log_probs.transpose(0, 1)
-        input_lengths = torch.full((log_probs.size(1),), log_probs.size(
-            0), dtype=torch.long, device=log_probs.device)
+        input_lengths = torch.full(
+            (log_probs.size(1),), log_probs.size(0),
+            dtype=torch.long, device=log_probs.device
+        )
 
+        # Prepare targets
         if targets.dim() == 2:
             target_lengths = lengths
             targets_flat = []
@@ -269,26 +291,33 @@ class MTLModel(nn.Module):
             warnings.warn(
                 "Sum of ASR target lengths does not match the flattened target tensor size.")
 
-        return self.ctc_loss(log_probs, targets_flat, input_lengths, target_lengths)
+        # Compute loss with regularization
+        loss, loss_details = self.ctc_loss(
+            log_probs, targets_flat, input_lengths, target_lengths)
+        return loss, loss_details
 
     def _compute_prosody_loss(self, logits, targets):
         """Compute loss for prosodic sequence labeling"""
         if self.config.prosody_classes == 2:
             if not torch.all((targets == 0) | (targets == 1)):
                 raise ValueError(
-                    f"Prosody target values for binary classification must be 0 or 1. Found values: {torch.unique(targets)}")
+                    f"Prosody target values for binary classification must be 0 or 1. "
+                    f"Found values: {torch.unique(targets)}")
             return self.prosody_loss(logits, targets.float())
         else:
             if targets.max() >= self.config.prosody_classes or targets.min() < 0:
                 raise ValueError(
-                    f"Prosody target values for multi-class classification are out of bounds. Max target: {targets.max()}, Min target: {targets.min()}, Max allowed: {self.config.prosody_classes - 1}")
+                    f"Prosody target values for multi-class classification are out of bounds. "
+                    f"Max target: {targets.max()}, Min target: {targets.min()}, "
+                    f"Max allowed: {self.config.prosody_classes - 1}")
             return self.prosody_loss(logits.view(-1, self.config.prosody_classes), targets.view(-1))
 
     def _compute_emotion_loss(self, logits, targets):
         """Compute cross-entropy loss for emotion classification"""
         if targets.max() >= self.config.emotion_classes or targets.min() < 0:
             raise ValueError(
-                f"Emotion target values are out of bounds. Max target: {targets.max()}, Min target: {targets.min()}, Max allowed: {self.config.emotion_classes - 1}")
+                f"Emotion target values are out of bounds. Max target: {targets.max()}, "
+                f"Min target: {targets.min()}, Max allowed: {self.config.emotion_classes - 1}")
         return self.ser_loss(logits, targets)
 
     def get_active_heads(self) -> Dict[str, bool]:

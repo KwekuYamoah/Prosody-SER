@@ -3,7 +3,7 @@ from torch.utils.data import Dataset
 from typing import Dict, Optional
 import numpy as np
 
-from mtl_config import MTLConfig
+from sample_code.scripts.mtl_config import MTLConfig
 
 
 class MTLDataset(Dataset):

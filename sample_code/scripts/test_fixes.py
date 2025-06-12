@@ -10,10 +10,10 @@ from datasets import load_dataset, Audio
 import os
 
 # Import your modules
-from mtl_config import MTLConfig
-from mtl_dataset import MTLDataset
-from backbone_models import BACKBONE_CONFIGS, BackboneModel
-from train_mtl import collate_fn_mtl
+from sample_code.scripts.mtl_config import MTLConfig
+from sample_code.scripts.mtl_dataset import MTLDataset
+from sample_code.scripts.backbone_models import BACKBONE_CONFIGS, BackboneModel
+from sample_code.training.utils import collate_fn_mtl
 
 
 def test_single_sample(audio_base_path, train_jsonl, backbone_name="xlsr"):

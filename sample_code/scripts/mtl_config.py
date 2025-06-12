@@ -1,10 +1,11 @@
 from dataclasses import dataclass
 from typing import Dict, Optional, Any
-from backbone_models import BackboneConfig, BACKBONE_CONFIGS
+from sample_code.scripts.backbone_models import BackboneConfig, BACKBONE_CONFIGS
+
 
 @dataclass
 class MTLConfig:
-    """Configuration class for MTL system"""
+    """Configuration class for MTL system with CTC-friendly defaults"""
     backbone_name: str = "whisper"  # Default to whisper
     vocab_size: int = 51865
     emotion_classes: int = 9
@@ -14,6 +15,14 @@ class MTLConfig:
     freeze_encoder: bool = True
     loss_weights: Optional[Dict[str, float]] = None
     custom_backbone_config: Optional[Dict[str, Any]] = None
+
+    # CTC-specific parameters
+    ctc_entropy_weight: float = 0.01  # Entropy regularization weight
+    ctc_blank_weight: float = 0.95    # Maximum allowed blank probability
+
+    # Learning rate scheduling
+    warmup_steps: int = 1000          # Warmup steps for ASR head
+    asr_lr_multiplier: float = 0.1    # Lower learning rate for ASR head
 
     def __post_init__(self):
         # Validate numeric parameters
@@ -27,28 +36,35 @@ class MTLConfig:
             raise ValueError("prosody_lstm_hidden must be positive")
         if not 0 <= self.final_dropout <= 1:
             raise ValueError("final_dropout must be between 0 and 1")
+        if not 0 <= self.ctc_entropy_weight <= 1:
+            raise ValueError("ctc_entropy_weight must be between 0 and 1")
+        if not 0 <= self.ctc_blank_weight <= 1:
+            raise ValueError("ctc_blank_weight must be between 0 and 1")
 
         # Handle custom backbone configuration
         if self.custom_backbone_config is not None:
-            self.backbone_config = BackboneConfig(**self.custom_backbone_config)
+            self.backbone_config = BackboneConfig(
+                **self.custom_backbone_config)
         else:
             # Get backbone config from predefined configs
             if self.backbone_name not in BACKBONE_CONFIGS:
                 raise ValueError(f"Unsupported backbone: {self.backbone_name}")
             self.backbone_config = BACKBONE_CONFIGS[self.backbone_name]
-        
+
         # Set loss weights if not provided
+        # IMPORTANT: Give ASR higher weight initially to prevent collapse
         if self.loss_weights is None:
             self.loss_weights = {
-                'asr': 1.0,
-                'prosody': 1.0,
-                'ser': 1.0
+                'asr': 1.0,      # Higher weight for ASR
+                'prosody': 0.5,  # Lower weight for prosody
+                'ser': 0.5       # Lower weight for emotion
             }
         else:
             # Validate loss weights
             required_tasks = {'asr', 'prosody', 'ser'}
             if not all(task in self.loss_weights for task in required_tasks):
-                raise ValueError(f"Loss weights must include all tasks: {required_tasks}")
+                raise ValueError(
+                    f"Loss weights must include all tasks: {required_tasks}")
             if not all(weight >= 0 for weight in self.loss_weights.values()):
                 raise ValueError("All loss weights must be non-negative")
 
@@ -57,10 +73,11 @@ class MTLConfig:
         # Validate new weights
         required_tasks = {'asr', 'prosody', 'ser'}
         if not all(task in new_weights for task in required_tasks):
-            raise ValueError(f"Loss weights must include all tasks: {required_tasks}")
+            raise ValueError(
+                f"Loss weights must include all tasks: {required_tasks}")
         if not all(weight >= 0 for weight in new_weights.values()):
             raise ValueError("All loss weights must be non-negative")
-        
+
         self.loss_weights = new_weights
 
     def get_summary(self) -> Dict[str, Any]:
@@ -74,7 +91,9 @@ class MTLConfig:
             'tasks': {
                 'asr': {
                     'vocab_size': self.vocab_size,
-                    'loss_weight': self.loss_weights['asr']
+                    'loss_weight': self.loss_weights['asr'],
+                    'entropy_weight': self.ctc_entropy_weight,
+                    'blank_weight': self.ctc_blank_weight
                 },
                 'prosody': {
                     'num_classes': self.prosody_classes,
@@ -87,7 +106,9 @@ class MTLConfig:
                 }
             },
             'training': {
-                'final_dropout': self.final_dropout
+                'final_dropout': self.final_dropout,
+                'warmup_steps': self.warmup_steps,
+                'asr_lr_multiplier': self.asr_lr_multiplier
             }
         }
 
@@ -102,10 +123,14 @@ class MTLConfig:
             'final_dropout': self.final_dropout,
             'freeze_encoder': self.freeze_encoder,
             'loss_weights': self.loss_weights,
-            'custom_backbone_config': self.custom_backbone_config
+            'custom_backbone_config': self.custom_backbone_config,
+            'ctc_entropy_weight': self.ctc_entropy_weight,
+            'ctc_blank_weight': self.ctc_blank_weight,
+            'warmup_steps': self.warmup_steps,
+            'asr_lr_multiplier': self.asr_lr_multiplier
         }
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'MTLConfig':
         """Create configuration from dictionary"""
-        return cls(**config_dict) 
+        return cls(**config_dict)

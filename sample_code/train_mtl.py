@@ -1,8 +1,8 @@
 import torch
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
-
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
+import json
 import os
 import gc
 import json
@@ -17,16 +17,17 @@ import matplotlib.pyplot as plt
 import math
 
 
-from mtl_config import MTLConfig
-from mtl_model import MTLModel
-from mtl_dataset import MTLDataset
-from backbone_models import BACKBONE_CONFIGS
-from backbone_models import BackboneModel
-from tokenizer import SentencePieceTokenizer
-from memory_utils import print_memory_usage, cleanup_memory, optimize_model_for_memory
+from sample_code.scripts.mtl_config import MTLConfig
+from sample_code.scripts.mtl_model import MTLModel
+from sample_code.scripts.mtl_dataset import MTLDataset
+from sample_code.scripts.backbone_models import BACKBONE_CONFIGS
+from sample_code.scripts.backbone_models import BackboneModel
+from sample_code.scripts.tokenizer import SentencePieceTokenizer
+from sample_code.scripts.ctc_decoder import CTCDecoder
+from sample_code.scripts.memory_utils import print_memory_usage, cleanup_memory, optimize_model_for_memory
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-# Add MTLConfig to safe globals for model loading
+# Add MTLConfig to safe globals for model loading 
 torch.serialization.add_safe_globals([MTLConfig])
 
 
@@ -46,39 +47,60 @@ class NumpyEncoder(json.JSONEncoder):
 class MTLEvaluator:
     """Class for evaluating MTL model performance"""
 
-    def __init__(self, model, tokenizer, device='cuda', use_amp=True):
+    def __init__(self, model, tokenizer, device='cuda', use_amp=True, decode_method='greedy'):
         self.model = model
         self.device = device
         self.tokenizer = tokenizer
         self.use_amp = use_amp
+        self.decode_method = decode_method
         self.model.to(device)
         self.model.eval()
 
-    def compute_asr_metrics(self, predictions: List, targets: List) -> Dict:
-        """
-        Compute ASR metrics (WER and CER) using the tokenizer.
-        """
-        # Decode predicted token IDs into text
-        pred_texts = []
-        for pred_ids in predictions:
-            # Filter consecutive duplicates (CTC decoding)
-            filtered_pred = []
-            prev_id = None
-            for id in pred_ids:
-                if id != prev_id and id != 0:  # Skip blanks and duplicates
-                    filtered_pred.append(id)
-                prev_id = id
+        # Initialize CTC decoder
+        self.ctc_decoder = CTCDecoder(blank_id=0, beam_width=10)
 
-            # Decode the filtered predictions
+    def compute_asr_metrics(self, predictions: List[torch.Tensor], targets: List[torch.Tensor],
+                            lengths: List[torch.Tensor] = None) -> Dict:
+        """
+        Compute ASR metrics (WER and CER) using proper CTC decoding.
+
+        Args:
+            predictions: List of logit tensors (not argmax'd)
+            targets: List of target token ID tensors
+            lengths: List of sequence lengths
+        """
+        # Decode predictions using CTC decoder
+        pred_texts = []
+        all_logits = torch.stack(predictions) if isinstance(
+            predictions[0], torch.Tensor) else predictions
+
+        # Use CTC decoder to get token sequences
+        decoded_sequences = self.ctc_decoder.decode_batch(
+            all_logits,
+            lengths=lengths,
+            method=self.decode_method
+        )
+
+        # Convert token sequences to text
+        for decoded_ids in decoded_sequences:
             pred_texts.append(self.tokenizer.decode(
-                filtered_pred, skip_special_tokens=True))
+                decoded_ids, skip_special_tokens=True))
 
         # Decode target token IDs into text
         target_texts = []
-        for target_ids in targets:
-            # Filter out padding tokens before decoding targets
-            filtered_ids = [id for id in target_ids if id !=
-                            self.tokenizer.pad_id]
+        for i, target_ids in enumerate(targets):
+            if torch.is_tensor(target_ids):
+                target_ids = target_ids.cpu().numpy()
+
+            # Get actual length and filter padding
+            if lengths is not None and i < len(lengths):
+                actual_length = lengths[i].item() if torch.is_tensor(
+                    lengths[i]) else lengths[i]
+                target_ids = target_ids[:actual_length]
+
+            # Filter out padding tokens
+            filtered_ids = [int(id)
+                            for id in target_ids if id != self.tokenizer.pad_id]
             target_texts.append(self.tokenizer.decode(
                 filtered_ids, skip_special_tokens=True))
 
@@ -92,13 +114,16 @@ class MTLEvaluator:
         ]
 
         # Calculate WER and CER on the decoded text
-        wer_score = wer(target_texts, pred_texts) if pred_texts else 1.0
-        cer_score = cer(target_texts, pred_texts) if pred_texts else 1.0
+        wer_score = wer(target_texts, pred_texts) if pred_texts and any(
+            pred_texts) else 1.0
+        cer_score = cer(target_texts, pred_texts) if pred_texts and any(
+            pred_texts) else 1.0
 
         return {
             "wer": wer_score,
             "cer": cer_score,
-            "detailed_results": detailed_results,
+            # Keep first 5 for inspection
+            "detailed_results": detailed_results[:5],
         }
 
     def flatten_and_filter_sequences(self, predictions, targets):
@@ -117,9 +142,10 @@ class MTLEvaluator:
         return np.array(flat_preds), np.array(flat_targets)
 
     def evaluate(self, data_loader: DataLoader) -> Dict:
-        """Evaluate model on a data loader with memory optimization"""
+        """Evaluate model on a data loader with proper CTC handling"""
         all_predictions = {"asr": [], "prosody": [], "emotion": []}
         all_targets = {"asr": [], "prosody": [], "emotion": []}
+        all_lengths = {"asr": []}
         detailed_results = {"prosody": [], "emotion": []}
 
         with torch.no_grad():
@@ -127,6 +153,8 @@ class MTLEvaluator:
                 input_features = batch["input_features"].to(
                     self.device, non_blocking=True)
                 asr_targets = batch["asr_targets"].to(
+                    self.device, non_blocking=True)
+                asr_lengths = batch["asr_lengths"].to(
                     self.device, non_blocking=True)
                 prosody_targets = batch["prosody_targets"].to(
                     self.device, non_blocking=True)
@@ -137,27 +165,34 @@ class MTLEvaluator:
                     outputs = self.model(
                         input_features=input_features,
                         asr_targets=asr_targets,
+                        asr_lengths=asr_lengths,
                         prosody_targets=prosody_targets,
                         emotion_targets=emotion_targets,
                     )
 
                 self._process_batch_predictions(
-                    outputs, batch, all_predictions, all_targets, detailed_results
+                    outputs, batch, all_predictions, all_targets, all_lengths, detailed_results
                 )
 
                 if batch_idx % 10 == 0:
                     torch.cuda.empty_cache()
+
                 del batch, outputs, input_features, asr_targets, prosody_targets, emotion_targets
 
-        return self._calculate_metrics(all_predictions, all_targets, detailed_results)
+        return self._calculate_metrics(all_predictions, all_targets, all_lengths, detailed_results)
 
-    def _process_batch_predictions(self, outputs, batch, all_predictions, all_targets, detailed_results):
-        """Process batch predictions efficiently with detailed results"""
+    def _process_batch_predictions(self, outputs, batch, all_predictions, all_targets,
+                                   all_lengths, detailed_results):
+        """Process batch predictions with proper CTC handling"""
         if 'asr_logits' in outputs and batch['asr_targets'] is not None:
-            asr_preds = outputs['asr_logits'].argmax(dim=-1).cpu().tolist()
-            asr_targets = batch['asr_targets'].cpu().tolist()
-            all_predictions['asr'].extend(asr_preds)
+            # Store logits for CTC decoding (not argmax)
+            asr_logits = outputs['asr_logits'].detach().cpu()
+            asr_targets = batch['asr_targets'].cpu()
+            asr_lengths = batch['asr_lengths'].cpu()
+
+            all_predictions['asr'].extend(asr_logits)
             all_targets['asr'].extend(asr_targets)
+            all_lengths['asr'].extend(asr_lengths)
 
         if 'prosody_logits' in outputs:
             prosody_preds = (outputs['prosody_logits'] > 0).float().cpu()
@@ -190,16 +225,21 @@ class MTLEvaluator:
                     'target': emotion_labels[emotion_targets[i]] if emotion_targets[i] < len(emotion_labels) else f"class_{emotion_targets[i]}"
                 })
 
-    def _calculate_metrics(self, all_predictions, all_targets, detailed_results):
-        """Calculate metrics for all tasks with detailed results"""
+    def _calculate_metrics(self, all_predictions, all_targets, all_lengths, detailed_results):
+        """Calculate metrics for all tasks with proper CTC decoding"""
         metrics = {}
+
         for task in ['asr', 'prosody', 'emotion']:
             if not all_predictions[task]:
                 continue
 
             if task == 'asr':
+                # Use proper CTC decoding for ASR metrics
                 metrics[task] = self.compute_asr_metrics(
-                    all_predictions['asr'], all_targets['asr'])
+                    all_predictions['asr'],
+                    all_targets['asr'],
+                    all_lengths['asr']
+                )
             elif task == 'prosody':
                 flat_preds, flat_targets = self.flatten_and_filter_sequences(
                     all_predictions['prosody'], all_targets['prosody'])
@@ -207,20 +247,19 @@ class MTLEvaluator:
                     metrics[task] = {
                         'accuracy': accuracy_score(flat_targets, flat_preds),
                         'f1': f1_score(flat_targets, flat_preds, average='weighted', zero_division=0),
-                        # Keep first 5 examples
                         'detailed_results': detailed_results['prosody'][:5]
                     }
             elif task == 'emotion':
                 metrics[task] = {
                     'accuracy': accuracy_score(all_targets['emotion'], all_predictions['emotion']),
                     'f1': f1_score(all_targets['emotion'], all_predictions['emotion'], average='weighted', zero_division=0),
-                    # Keep first 5 examples
                     'detailed_results': detailed_results['emotion'][:5]
                 }
+
         return metrics
 
     def print_detailed_results(self, metrics):
-        """Print detailed results for each task - FIXED VERSION"""
+        """Print detailed results for each task"""
         print("\nDetailed Evaluation Results:")
 
         for task in ['asr', 'prosody', 'emotion']:
@@ -364,6 +403,18 @@ class MTLTrainer:
             if 'emotion_loss' in outputs:
                 epoch_losses['emotion'] += outputs['emotion_loss'].item()
 
+            if 'loss_details' in outputs:
+                if 'loss_details' not in epoch_losses:
+                    epoch_losses['loss_details'] = {}
+                for task, details in outputs['loss_details'].items():
+                    if task not in epoch_losses['loss_details']:
+                        epoch_losses['loss_details'][task] = {}
+                    for key, value in details.items():
+                        if key not in epoch_losses['loss_details'][task]:
+                            epoch_losses['loss_details'][task][key] = 0
+                        epoch_losses['loss_details'][task][key] += value.item(
+                        ) if torch.is_tensor(value) else value
+
             num_batches += 1
 
             # Clear cache periodically
@@ -374,8 +425,13 @@ class MTLTrainer:
             del batch, outputs, total_loss
 
         # Average losses
-        for key in epoch_losses:
-            epoch_losses[key] /= num_batches
+        # for key in epoch_losses:
+        #     epoch_losses[key] /= num_batches
+
+        # if 'loss_details' in epoch_losses:
+        #     for task in epoch_losses['loss_details']:
+        #         for key in epoch_losses['loss_details'][task]:
+        #             epoch_losses['loss_details'][task][key] /= num_batches
 
         return epoch_losses
 
@@ -438,6 +494,29 @@ class MTLTrainer:
 
         return losses
 
+    def create_optimizer_with_differential_lr(self, model, base_lr: float,
+                                              asr_lr_multiplier: float = 0.1) -> torch.optim.Optimizer:
+        """Create optimizer with different learning rates for ASR head"""
+        asr_params = []
+        other_params = []
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:  # Only include trainable parameters
+                if 'asr_head' in name or 'asr_layer_norm' in name:
+                    asr_params.append(param)
+                else:
+                    other_params.append(param)
+
+        param_groups = []
+        if other_params:
+            param_groups.append(
+                {'params': other_params, 'lr': base_lr, 'name': 'other'})
+        if asr_params:
+            param_groups.append(
+                {'params': asr_params, 'lr': base_lr * asr_lr_multiplier, 'name': 'asr'})
+
+        return torch.optim.AdamW(param_groups, weight_decay=0.01, eps=1e-8)
+
     def train(
         self,
         train_loader,
@@ -462,10 +541,9 @@ class MTLTrainer:
             # Training
             train_losses = self.train_epoch(train_loader, optimizer, scheduler)
 
-            # Validation
-            from train_mtl import MTLEvaluator  # Import here to avoid circular import
+            # Validation - FIXED: No circular import needed
             evaluator = MTLEvaluator(
-                self.model, tokenizer, self.device, self.use_amp)
+                self.model, tokenizer, self.device, self.use_amp, decode_method='greedy')
             val_metrics = evaluator.evaluate(val_loader)
 
             # Calculate validation loss
@@ -544,6 +622,285 @@ class MTLTrainer:
 
         self.save_history(os.path.join(save_dir, 'training_history.json'))
 
+    def train_with_freeze_unfreeze(self, train_loader, val_loader, num_epochs, tokenizer, base_lr=1e-4,
+                                   save_dir='checkpoints', early_stopping_patience=7, checkpoint_interval=5, unfreeze_epoch_ratio=0.5,
+                                   lr_reduction_factor=0.1, dynamic_loss_weights=True
+                                   ):
+        """
+        Complete training loop with freeze/unfreeze strategy.
+
+        Args:
+            unfreeze_epoch_ratio: Fraction of epochs to train with frozen encoder
+            lr_reduction_factor: Factor to reduce LR when unfreezing
+            dynamic_loss_weights: Whether to adjust loss weights during training
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        best_val_loss = float('inf')
+        patience_counter = 0
+        best_epoch = 0
+        unfreeze_epoch = int(num_epochs * unfreeze_epoch_ratio)
+
+        # Initial setup
+        print(f"\nTraining Configuration:")
+        print(f"  Total epochs: {num_epochs}")
+        print(f"  Unfreeze at epoch: {unfreeze_epoch}")
+        print(
+            f"  Initial encoder state: {'Frozen' if self.model.config.freeze_encoder else 'Unfrozen'}")
+
+        # Freeze encoder initially
+        if self.model.config.freeze_encoder:
+            self.model.backbone.freeze_encoder()
+            print(
+                f"  Trainable parameters: {self.model.backbone.get_num_trainable_params():,}")
+            print(
+                f"  Total parameters: {self.model.backbone.get_num_total_params():,}")
+
+        # Create optimizer with differential learning rates
+        optimizer = self.create_optimizer_with_differential_lr(
+            self.model,
+            base_lr=base_lr,
+            asr_lr_multiplier=self.model.config.asr_lr_multiplier
+        )
+
+        # Create scheduler
+        scheduler = ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+
+        # Add to history tracking
+        if 'freeze_status' not in self.history:
+            self.history['freeze_status'] = []
+        if 'loss_weights' not in self.history:
+            self.history['loss_weights'] = []
+
+        for epoch in range(num_epochs):
+            print(f"\n{'='*50}")
+            print(f"Epoch {epoch + 1}/{num_epochs}")
+            print(f"{'='*50}")
+
+            # Check if we should unfreeze
+            if epoch == unfreeze_epoch and self.model.backbone.is_frozen():
+                print(f"\n Unfreezing encoder at epoch {epoch + 1}")
+                self.model.backbone.unfreeze_encoder()
+
+                # Reduce learning rate for all parameters
+                for param_group in optimizer.param_groups:
+                    old_lr = param_group['lr']
+                    param_group['lr'] *= lr_reduction_factor
+                    print(
+                        f"  {param_group['name']} LR: {old_lr:.2e} → {param_group['lr']:.2e}")
+
+                print(
+                    f"  Trainable parameters: {self.model.backbone.get_num_trainable_params():,}")
+
+            # Dynamic loss weight adjustment
+            if dynamic_loss_weights:
+                if epoch < unfreeze_epoch:
+                    # Stage 1: Higher ASR weight
+                    loss_weights = {'asr': 1.0, 'prosody': 0.3, 'ser': 0.3}
+                elif epoch < unfreeze_epoch + 5:
+                    # Transition period: Gradually balance weights
+                    progress = (epoch - unfreeze_epoch) / 5
+                    asr_weight = 1.0 - 0.3 * progress  # 1.0 → 0.7
+                    other_weight = 0.3 + 0.4 * progress  # 0.3 → 0.7
+                    loss_weights = {'asr': asr_weight,
+                                    'prosody': other_weight, 'ser': other_weight}
+                else:
+                    # Stage 2: Balanced weights
+                    loss_weights = {'asr': 0.7, 'prosody': 0.7, 'ser': 0.7}
+
+                self.model.config.update_loss_weights(loss_weights)
+                print(f"  Loss weights: ASR={loss_weights['asr']:.2f}, "
+                      f"Prosody={loss_weights['prosody']:.2f}, SER={loss_weights['ser']:.2f}")
+
+            # Training
+            train_losses = self.train_epoch(train_loader, optimizer)
+
+            # Print CTC loss details if available
+            if 'loss_details' in train_losses and 'asr' in train_losses['loss_details']:
+                print(f"\nCTC Loss Details:")
+                print(
+                    f"  CTC Loss: {train_losses['loss_details']['asr']['ctc_loss']:.4f}")
+                print(
+                    f"  Entropy Loss: {train_losses['loss_details']['asr']['entropy_loss']:.4f}")
+                print(
+                    f"  Blank Penalty: {train_losses['loss_details']['asr']['blank_penalty']:.4f}")
+
+            # Validation
+            evaluator = MTLEvaluator(
+                self.model, tokenizer, self.device, self.use_amp, decode_method='greedy')
+            val_metrics = evaluator.evaluate(val_loader)
+            val_losses = self.evaluate_loss(val_loader)
+
+            # Update scheduler
+            scheduler.step(val_losses['total'])
+
+            # Print results
+            print(f"\nEpoch {epoch + 1} Results:")
+            print(f"  Train Loss: {train_losses['total']:.4f}")
+            print(f"  Val Loss: {val_losses['total']:.4f}")
+            evaluator.print_detailed_results(val_metrics)
+
+            # Update history
+            self.history['train_loss'].append(train_losses)
+            self.history['val_loss'].append(val_losses)
+            self.history['val_metrics'].append(val_metrics)
+            self.history['freeze_status'].append(
+                self.model.backbone.is_frozen())
+            self.history['loss_weights'].append(
+                self.model.config.loss_weights.copy())
+
+            # Save best model
+            if val_losses['total'] < best_val_loss:
+                best_val_loss = val_losses['total']
+                best_epoch = epoch
+                patience_counter = 0
+                self.save_checkpoint(
+                    os.path.join(save_dir, 'best_model.pt'),
+                    epoch, optimizer, scheduler, is_best=True
+                )
+                print(
+                    f"\n New best model saved! (Val Loss: {best_val_loss:.4f})")
+            else:
+                patience_counter += 1
+
+            # Periodic checkpoints
+            if (epoch + 1) % checkpoint_interval == 0:
+                checkpoint_path = os.path.join(
+                    save_dir, f'checkpoint_epoch_{epoch+1}.pt')
+                self.save_checkpoint(
+                    checkpoint_path, epoch, optimizer, scheduler)
+                print(f" Checkpoint saved at epoch {epoch+1}")
+
+            # Early stopping
+            if patience_counter >= early_stopping_patience:
+                print(f"\n Early stopping triggered after {epoch + 1} epochs")
+                break
+
+        # Copy best model to final
+        best_path = os.path.join(save_dir, 'best_model.pt')
+        final_path = os.path.join(save_dir, 'final_model.pt')
+        if os.path.exists(best_path):
+            import shutil
+            shutil.copy2(best_path, final_path)
+            print(
+                f"\n Best model (epoch {best_epoch + 1}) copied to final_model.pt")
+
+        # Save training history
+        self.save_history(os.path.join(save_dir, 'training_history.json'))
+
+        # Plot enhanced training history
+        self.plot_enhanced_training_history(
+            os.path.join(save_dir, 'training_history.png'))
+
+    def plot_enhanced_training_history(self, save_path=None):
+        """Plot enhanced training history with freeze/unfreeze markers"""
+        if len(self.history['train_loss']) == 0:
+            print("No training history to plot")
+            return
+
+        plt.figure(figsize=(20, 12))
+        epochs = range(len(self.history['train_loss']))
+
+        # Plot 1: Total Loss with freeze/unfreeze regions
+        plt.subplot(3, 2, 1)
+        train_total = [x['total'] for x in self.history['train_loss']]
+        val_total = [x['total'] for x in self.history['val_loss']]
+
+        plt.plot(epochs, train_total, label='Train Loss', linewidth=2)
+        plt.plot(epochs, val_total, label='Val Loss', linewidth=2)
+
+        # Add freeze/unfreeze shading
+        if 'freeze_status' in self.history:
+            frozen_epochs = [i for i, frozen in enumerate(
+                self.history['freeze_status']) if frozen]
+            if frozen_epochs:
+                plt.axvspan(0, max(frozen_epochs) + 1, alpha=0.2,
+                            color='blue', label='Encoder Frozen')
+
+        plt.title('Total Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # Plot 2: Individual Task Losses
+        plt.subplot(3, 2, 2)
+        for task in ['asr', 'prosody', 'emotion']:
+            if task in self.history['train_loss'][0]:
+                values = [x.get(task, 0) for x in self.history['train_loss']]
+                plt.plot(epochs, values,
+                         label=f'{task.upper()} Loss', linewidth=2)
+
+        plt.title('Individual Task Losses (Training)')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # Plot 3: ASR Metrics
+        plt.subplot(3, 2, 3)
+        if len(self.history['val_metrics']) > 0 and 'asr' in self.history['val_metrics'][0]:
+            wer_values = [x['asr'].get('wer', 1.0)
+                          for x in self.history['val_metrics']]
+            cer_values = [x['asr'].get('cer', 1.0)
+                          for x in self.history['val_metrics']]
+            plt.plot(epochs, wer_values, label='WER', linewidth=2)
+            plt.plot(epochs, cer_values, label='CER', linewidth=2)
+
+        plt.title('ASR Metrics')
+        plt.xlabel('Epoch')
+        plt.ylabel('Error Rate')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # Plot 4: Prosody & Emotion Metrics
+        plt.subplot(3, 2, 4)
+        for task in ['prosody', 'emotion']:
+            if len(self.history['val_metrics']) > 0 and task in self.history['val_metrics'][0]:
+                acc_values = [x[task].get('accuracy', 0)
+                              for x in self.history['val_metrics']]
+                plt.plot(epochs, acc_values,
+                         label=f'{task.capitalize()} Accuracy', linewidth=2)
+
+        plt.title('Classification Metrics')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # Plot 5: Loss Weights Evolution
+        plt.subplot(3, 2, 5)
+        if 'loss_weights' in self.history and self.history['loss_weights']:
+            asr_weights = [x['asr'] for x in self.history['loss_weights']]
+            prosody_weights = [x['prosody']
+                               for x in self.history['loss_weights']]
+            ser_weights = [x['ser'] for x in self.history['loss_weights']]
+
+            plt.plot(epochs, asr_weights, label='ASR Weight', linewidth=2)
+            plt.plot(epochs, prosody_weights,
+                     label='Prosody Weight', linewidth=2)
+            plt.plot(epochs, ser_weights, label='SER Weight', linewidth=2)
+
+        plt.title('Loss Weight Evolution')
+        plt.xlabel('Epoch')
+        plt.ylabel('Weight')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # Plot 6: Learning Rate Evolution
+        plt.subplot(3, 2, 6)
+        plt.text(0.5, 0.5, 'Learning Rate Plot\n(Add LR tracking to history)',
+                 ha='center', va='center', transform=plt.gca().transAxes)
+        plt.title('Learning Rate Schedule')
+        plt.xlabel('Epoch')
+        plt.ylabel('Learning Rate')
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+
     def save_checkpoint(self, path, epoch, optimizer, scheduler=None, is_best=False):
         """Save complete checkpoint with optimizer state"""
         checkpoint = {
@@ -554,6 +911,27 @@ class MTLTrainer:
             'is_best': is_best,
             'history': self.history,
             'gradient_accumulation_steps': self.gradient_accumulation_steps
+        }
+
+        if scheduler is not None:
+            checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+
+        if self.use_amp and self.scaler is not None:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+
+        torch.save(checkpoint, path)
+
+    def save_checkpoint_enhanced(self, path, epoch, optimizer, scheduler=None, is_best=False):
+        """Save complete checkpoint with freeze status"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'config': self.model.config,
+            'is_best': is_best,
+            'history': self.history,
+            'gradient_accumulation_steps': self.gradient_accumulation_steps,
+            'is_encoder_frozen': self.model.backbone.is_frozen()
         }
 
         if scheduler is not None:
@@ -594,9 +972,33 @@ class MTLTrainer:
 
         return checkpoint.get('epoch', 0)
 
+    def load_checkpoint_enhanced(self, path, optimizer=None, scheduler=None):
+        """Load complete checkpoint with freeze status"""
+        checkpoint = torch.load(
+            path, map_location=self.device, weights_only=False)
+
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        if self.use_amp and 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+        if 'history' in checkpoint:
+            self.history = checkpoint['history']
+
+        if 'is_encoder_frozen' in checkpoint and checkpoint['is_encoder_frozen']:
+            self.model.backbone.freeze_encoder()
+
+        return checkpoint.get('epoch', 0)
+
     def save_history(self, path):
         """Save training history"""
-        from train_mtl import NumpyEncoder  # Import the custom encoder
+        from sample_code.train_mtl import NumpyEncoder  # Import the custom encoder
 
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(self.history, f, indent=4,
@@ -795,6 +1197,23 @@ if __name__ == "__main__":
                         help="Scale learning rate with gradient accumulation")
     parser.add_argument("--use_scheduler", action="store_true",
                         help="Use cosine annealing learning rate scheduler")
+
+    # New arguments for freeze/unfreeze strategy
+    parser.add_argument("--freeze_encoder_initially", action="store_true", default=True,
+                        help="Whether to freeze encoder initially")
+    parser.add_argument("--unfreeze_epoch_ratio", type=float, default=0.5,
+                        help="Fraction of epochs to train with frozen encoder")
+    parser.add_argument("--lr_reduction_factor", type=float, default=0.1,
+                        help="Factor to reduce LR when unfreezing")
+    parser.add_argument("--ctc_entropy_weight", type=float, default=0.01,
+                        help="Entropy regularization weight for CTC")
+    parser.add_argument("--ctc_blank_weight", type=float, default=0.95,
+                        help="Maximum blank probability for CTC")
+    parser.add_argument("--asr_lr_multiplier", type=float, default=0.1,
+                        help="Learning rate multiplier for ASR head")
+    parser.add_argument("--use_enhanced_training", action="store_true", default=True,
+                        help="Use enhanced training with freeze/unfreeze strategy")
+
     args = parser.parse_args()
 
     # Calculate effective batch size
@@ -803,6 +1222,19 @@ if __name__ == "__main__":
     print(f"  Per-GPU batch size: {args.batch_size}")
     print(f"  Gradient accumulation steps: {args.gradient_accumulation_steps}")
     print(f"  Effective batch size: {effective_batch_size}")
+    print(f"  Enhanced training: {args.use_enhanced_training}")
+
+    if args.use_enhanced_training:
+        print(f"  Freeze/Unfreeze Strategy:")
+        print(
+            f"    Initial state: {'Frozen' if args.freeze_encoder_initially else 'Unfrozen'}")
+        print(
+            f"    Unfreeze at: {int(args.num_epochs * args.unfreeze_epoch_ratio)} epochs")
+        print(f"    LR reduction: {args.lr_reduction_factor}x")
+        print(f"  CTC Configuration:")
+        print(f"    Entropy weight: {args.ctc_entropy_weight}")
+        print(f"    Blank weight: {args.ctc_blank_weight}")
+        print(f"    ASR LR multiplier: {args.asr_lr_multiplier}")
 
     base_lr = args.lr
     if args.scale_lr_with_accumulation and args.gradient_accumulation_steps > 1:
@@ -831,7 +1263,9 @@ if __name__ == "__main__":
 
     # Initialize wandb if enabled
     if args.use_wandb:
-        wandb.init(project="mtl-speech", config=vars(args))
+        config_dict = vars(args)
+        config_dict['effective_batch_size'] = effective_batch_size
+        wandb.init(project="mtl-speech", config=config_dict)
 
     # ============================================================================
     # PHASE 1: LOAD TRAINING DATA AND TRAIN MODEL
@@ -886,19 +1320,37 @@ if __name__ == "__main__":
     print(f"Sample encoding test: {ids}")
     print(f"Sample decode test: {decoded}\n")
 
-    # Create config
-    config = MTLConfig(
-        backbone_name=args.backbone,
-        vocab_size=tokenizer.get_vocab_size(),
-        emotion_classes=9,
-        prosody_classes=2,
-        loss_weights={
-            'asr': 0.3,
-            'prosody': 0.3,
-            'ser': 0.4
-        },
-
-    )
+    if args.use_enhanced_training:
+        config = MTLConfig(
+            backbone_name=args.backbone,
+            vocab_size=tokenizer.get_vocab_size(),
+            emotion_classes=9,
+            prosody_classes=2,
+            freeze_encoder=args.freeze_encoder_initially,
+            loss_weights={
+                'asr': 1.0,      # Higher weight initially
+                'prosody': 0.3,  # Lower weight initially
+                'ser': 0.3       # Lower weight initially
+            },
+            # CTC parameters
+            ctc_entropy_weight=args.ctc_entropy_weight,
+            ctc_blank_weight=args.ctc_blank_weight,
+            asr_lr_multiplier=args.asr_lr_multiplier,
+            warmup_steps=1000
+        )
+    else:
+        # Original config for standard training
+        config = MTLConfig(
+            backbone_name=args.backbone,
+            vocab_size=tokenizer.get_vocab_size(),
+            emotion_classes=9,
+            prosody_classes=2,
+            loss_weights={
+                'asr': 0.3,
+                'prosody': 0.3,
+                'ser': 0.4
+            },
+        )
 
     # Create model
     model = MTLModel(
@@ -976,29 +1428,6 @@ if __name__ == "__main__":
     print("PHASE 2: TRAINING MODEL")
     print("="*50)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=adjusted_lr,
-        weight_decay=0.01,
-        eps=1e-8,
-        betas=(0.9, 0.999)
-    )
-
-    # Initialize scheduler if requested
-    scheduler = None
-    if args.use_scheduler:
-        # Calculate total training steps accounting for accumulation
-        steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
-        total_steps = steps_per_epoch * args.num_epochs
-
-        scheduler = CosineAnnealingLR(
-            optimizer,
-            T_max=total_steps,
-            eta_min=1e-6
-        )
-        print(
-            f"  Using cosine annealing scheduler with {total_steps} total steps")
-
     # Train with memory monitoring
     trainer = MTLTrainer(
         model,
@@ -1008,18 +1437,72 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps
     )
 
+    # Add the enhanced methods to the trainer instance
+    # trainer.create_optimizer_with_differential_lr = lambda model, base_lr, asr_lr_multiplier: create_optimizer_with_differential_lr(
+    #     trainer, model, base_lr, asr_lr_multiplier)
+    # trainer.train_with_freeze_unfreeze = lambda *args, **kwargs: train_with_freeze_unfreeze(
+    #     trainer, *args, **kwargs)
+    # trainer.plot_enhanced_training_history = lambda *args, **kwargs: plot_enhanced_training_history(
+    #     trainer, *args, **kwargs)
+    # trainer.save_checkpoint = lambda *args, **kwargs: save_checkpoint_enhanced(
+    #     trainer, *args, **kwargs)
+    # trainer.load_checkpoint = lambda *args, **kwargs: load_checkpoint_enhanced(
+    #     trainer, *args, **kwargs)
+
     print("\nStarting training...")
-    trainer.train(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        num_epochs=args.num_epochs,
-        tokenizer=tokenizer,
-        save_dir=args.save_dir,
-        early_stopping_patience=5,
-        checkpoint_interval=5
-    )
+
+    if args.use_enhanced_training:
+        # Use enhanced training with freeze/unfreeze strategy
+        trainer.train_with_freeze_unfreeze(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            num_epochs=args.num_epochs,
+            tokenizer=tokenizer,
+            base_lr=adjusted_lr,
+            save_dir=args.save_dir,
+            early_stopping_patience=7,  # More patience for two-stage training
+            checkpoint_interval=5,
+            unfreeze_epoch_ratio=args.unfreeze_epoch_ratio,
+            lr_reduction_factor=args.lr_reduction_factor,
+            dynamic_loss_weights=True
+        )
+    else:
+        # Use original training method
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=adjusted_lr,
+            weight_decay=0.01,
+            eps=1e-8,
+            betas=(0.9, 0.999)
+        )
+
+        # Initialize scheduler if requested
+        scheduler = None
+        if args.use_scheduler:
+            # Calculate total training steps accounting for accumulation
+            steps_per_epoch = len(
+                train_loader) // args.gradient_accumulation_steps
+            total_steps = steps_per_epoch * args.num_epochs
+
+            scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=total_steps,
+                eta_min=1e-6
+            )
+            print(
+                f"  Using cosine annealing scheduler with {total_steps} total steps")
+
+            trainer.train(
+                train_loader=train_loader,
+                val_loader=val_loader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                num_epochs=args.num_epochs,
+                tokenizer=tokenizer,
+                save_dir=args.save_dir,
+                early_stopping_patience=5,
+                checkpoint_interval=5
+            )
 
     print_memory_usage("After training:")
 
@@ -1028,10 +1511,14 @@ if __name__ == "__main__":
     cleanup_memory()
 
     # Plot training history
-    trainer.plot_training_history(
-        os.path.join(args.save_dir, 'training_history.png')
-    )
-
+    if args.use_enhanced_training:
+        trainer.plot_enhanced_training_history(
+            os.path.join(args.save_dir, 'training_history.png')
+        )
+    else:
+        trainer.plot_training_history(
+            os.path.join(args.save_dir, 'training_history.png')
+        )
     print("\nTraining completed!")
 
     # ============================================================================
@@ -1065,7 +1552,9 @@ if __name__ == "__main__":
     print("\nEvaluating on test set...")
     # Load best model and evaluate on test set
     trainer.load_checkpoint(os.path.join(args.save_dir, 'best_model.pt'))
-    evaluator = MTLEvaluator(model, tokenizer, device, use_amp=args.use_amp)
+
+    evaluator = MTLEvaluator(model, tokenizer, device,
+                             use_amp=args.use_amp, decode_method='beam')
     test_metrics = evaluator.evaluate(test_loader)
     evaluator.print_detailed_results(test_metrics)
 
@@ -1087,5 +1576,18 @@ if __name__ == "__main__":
             "per_gpu_batch_size": args.batch_size,
             "learning_rate": adjusted_lr,
             "base_learning_rate": base_lr,
-            "use_scheduler": args.use_scheduler
+            "use_scheduler": args.use_scheduler,
+            "enhanced_training": args.use_enhanced_training
         })
+
+        if args.use_enhanced_training:
+            wandb.config.update({
+                "freeze_encoder_initially": args.freeze_encoder_initially,
+                "unfreeze_epoch_ratio": args.unfreeze_epoch_ratio,
+                "lr_reduction_factor": args.lr_reduction_factor,
+                "ctc_entropy_weight": args.ctc_entropy_weight,
+                "ctc_blank_weight": args.ctc_blank_weight,
+                "asr_lr_multiplier": args.asr_lr_multiplier
+            })
+
+        wandb.finish()
