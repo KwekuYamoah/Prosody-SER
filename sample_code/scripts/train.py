@@ -1,485 +1,502 @@
+#!/usr/bin/env python3
 """
-Main Training Script for MTL Model
-Clean and modular implementation
+Improved training script for MTL model following the paper's approach.
+Cleaner, more efficient, and easier to debug.
 """
 
-import torch
 import os
-import argparse
-import math
+import sys
+import logging
 import json
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List
+import numpy as np
+import torch
+from torch import nn
+from transformers import (
+    HfArgumentParser,
+    Trainer,
+    TrainingArguments,
+    AutoProcessor,
+    AutoFeatureExtractor,
+    AutoTokenizer,
+    set_seed,
+    EvalPrediction
+)
+from transformers.trainer_utils import get_last_checkpoint
+import datasets
+from sklearn.metrics import accuracy_score, f1_score
 import wandb
-from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# Import core modules
-from sample_code.scripts.mtl_config import MTLConfig
-from sample_code.scripts.mtl_model import MTLModel
-from sample_code.scripts.mtl_dataset import MTLDataset
 from sample_code.scripts.backbone_models import BACKBONE_CONFIGS, BackboneModel
+from sample_code.scripts.mtl_model import MTLModel, MTLOutput
+from sample_code.scripts.mtl_dataset import MTLDataset, DataCollatorMTLWithPadding
+from sample_code.scripts.mtl_config import MTLConfig
 from sample_code.scripts.tokenizer import SentencePieceTokenizer
 
-# Import utilities
-from sample_code.scripts.memory_utils import print_memory_usage, cleanup_memory, optimize_model_for_memory
+# For ASR metrics
+try:
+    from jiwer import wer, cer
+except ImportError:
+    print("jiwer not installed. ASR metrics will not be available.")
+    wer = cer = None
 
-# Import training modules
-from sample_code.training import MTLTrainer, MTLEvaluator, collate_fn_mtl, configure_cuda_memory, NumpyEncoder
-
-from sample_code.utils import (
-    setup_tokenizer_and_dataset,
-    load_and_prepare_datasets,
-    plot_training_history,
-    plot_enhanced_training_history
-)
-
-# Set environment variables
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-torch.serialization.add_safe_globals([MTLConfig])
+logger = logging.getLogger(__name__)
 
 
-def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description="Train MTL Speech Model")
-
-    # Model configuration
-    parser.add_argument("--backbone", type=str, default="whisper",
-                        choices=list(BACKBONE_CONFIGS.keys()),
-                        help="Backbone model to use")
-    parser.add_argument("--vocab_size", type=int, default=4000,
-                        help="Vocabulary size for tokenizer")
-
-    # Data configuration
-    parser.add_argument("--audio_base_path", type=str, required=True,
-                        help="Base path to audio files directory")
-    parser.add_argument("--train_jsonl", type=str, required=True,
-                        help="Path to training JSONL file")
-    parser.add_argument("--val_jsonl", type=str, required=True,
-                        help="Path to validation JSONL file")
-    parser.add_argument("--test_jsonl", type=str, required=True,
-                        help="Path to test JSONL file")
-
-    # Training configuration
-    parser.add_argument("--batch_size", type=int, default=8,
-                        help="Batch size per GPU")
-    parser.add_argument("--num_epochs", type=int, default=10,
-                        help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Base learning rate")
-    parser.add_argument("--save_dir", type=str, default="checkpoints",
-                        help="Directory to save checkpoints")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
-                        help="Number of gradient accumulation steps")
-    parser.add_argument("--early_stopping_patience", type=int, default=5,
-                        help="Patience for early stopping")
-    parser.add_argument("--checkpoint_interval", type=int, default=5,
-                        help="Save checkpoint every N epochs")
-
-    # Advanced training options
-    parser.add_argument("--use_enhanced_training", action="store_true", default=True,
-                        help="Use enhanced training with freeze/unfreeze strategy")
-    parser.add_argument("--freeze_encoder_initially", action="store_true", default=True,
-                        help="Whether to freeze encoder initially")
-    parser.add_argument("--unfreeze_epoch_ratio", type=float, default=0.5,
-                        help="Fraction of epochs to train with frozen encoder")
-    parser.add_argument("--lr_reduction_factor", type=float, default=0.1,
-                        help="Factor to reduce LR when unfreezing")
-    parser.add_argument("--asr_lr_multiplier", type=float, default=0.1,
-                        help="Learning rate multiplier for ASR head")
-
-    # CTC configuration
-    parser.add_argument("--ctc_entropy_weight", type=float, default=0.01,
-                        help="Entropy regularization weight for CTC")
-    parser.add_argument("--ctc_blank_weight", type=float, default=0.95,
-                        help="Maximum blank probability for CTC")
-
-    # Tokenizer options
-    parser.add_argument("--tokenizer_path", type=str,
-                        help="Path to trained tokenizer")
-    parser.add_argument("--retrain_tokenizer", action="store_true",
-                        help="Whether to retrain the tokenizer")
-
-    # Other options
-    parser.add_argument("--use_wandb", action="store_true",
-                        help="Use Weights & Biases for experiment tracking")
-    parser.add_argument("--use_amp", action="store_true", default=True,
-                        help="Use automatic mixed precision training")
-    parser.add_argument("--use_scheduler", action="store_true",
-                        help="Use cosine annealing learning rate scheduler")
-    parser.add_argument("--scale_lr_with_accumulation", action="store_true",
-                        help="Scale learning rate with gradient accumulation")
-
-    return parser.parse_args()
+@dataclass
+class ModelArguments:
+    """Arguments for model configuration"""
+    backbone_name: str = field(
+        default="whisper",
+        metadata={
+            "help": "Pretrained model name  in [whisper, xlsr, mms, wav2vec2-bert]"}
+    )
+    vocab_size: int = field(
+        default=16000,
+        metadata={"help": "Vocabulary size for ASR"}
+    )
+    emotion_classes: int = field(
+        default=9,
+        metadata={"help": "Number of emotion classes"}
+    )
+    alpha_asr: float = field(
+        default=0.1,
+        metadata={"help": "Weight for ASR auxiliary task"}
+    )
+    alpha_prosody: float = field(
+        default=0.1,
+        metadata={"help": "Weight for Prosody auxiliary task"}
+    )
+    freeze_feature_extractor: bool = field(
+        default=False,
+        metadata={"help": "Whether to freeze feature extractor"}
+    )
+    cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Cache directory for pretrained models"}
+    )
 
 
-def setup_config(args, tokenizer):
-    """Setup model configuration based on arguments"""
-    if args.use_enhanced_training:
-        config = MTLConfig(
-            backbone_name=args.backbone,
-            vocab_size=tokenizer.get_vocab_size(),
-            emotion_classes=9,
-            prosody_classes=2,
-            freeze_encoder=args.freeze_encoder_initially,
-            loss_weights={
-                'asr': 1.0,      # Higher weight initially
-                'prosody': 0.3,  # Lower weight initially
-                'ser': 0.3       # Lower weight initially
-            },
-            # CTC parameters
-            ctc_entropy_weight=args.ctc_entropy_weight,
-            ctc_blank_weight=args.ctc_blank_weight,
-            asr_lr_multiplier=args.asr_lr_multiplier,
-            warmup_steps=1000
-        )
+@dataclass
+class DataArguments:
+    """Arguments for data configuration"""
+    train_json: str = field(
+        metadata={"help": "Path to training JSONL file"}
+    )
+    val_json: str = field(
+        metadata={"help": "Path to validation JSONL file"}
+    )
+    audio_base_path: str = field(
+        metadata={"help": "Base path for audio files"}
+    )
+    test_json: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to test JSONL file"}
+    )
+    max_duration_in_seconds: Optional[float] = field(
+        default=60.0,
+        metadata={"help": "Maximum audio duration"}
+    )
+    preprocessing_num_workers: int = field(
+        default=4,
+        metadata={"help": "Number of workers for preprocessing"}
+    )
+    emotion_label_map: Optional[str] = field(
+        default=None,
+        metadata={"help": "JSON string mapping emotion names to indices"}
+    )
+
+
+class MTLTrainer(Trainer):
+    """Custom trainer for multi-task learning"""
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """Compute multi-task loss"""
+        outputs = model(**inputs)
+        loss = outputs.loss if isinstance(outputs, MTLOutput) else outputs[0]
+        return (loss, outputs) if return_outputs else loss
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """Custom prediction step to handle multiple outputs"""
+        with torch.no_grad():
+            with self.autocast_smart_context_manager():
+                outputs = model(**inputs)
+                loss = outputs.loss if isinstance(
+                    outputs, MTLOutput) else outputs[0]
+
+                if isinstance(outputs, MTLOutput):
+                    # Extract logits for each task
+                    ser_logits = outputs.ser_logits
+                    asr_logits = outputs.asr_logits
+                    prosody_logits = outputs.prosody_logits
+                    logits = (ser_logits, asr_logits, prosody_logits)
+                else:
+                    # Assuming (loss, ser, asr, prosody, ...)
+                    logits = outputs[1:4]
+
+        if prediction_loss_only:
+            return (loss, None, None)
+
+        # Return predictions and labels
+        labels = inputs.get("labels", None)
+        return (loss, logits, labels)
+
+
+def compute_metrics(eval_pred: EvalPrediction, tokenizer="akan_mtl_tokenizer.model") -> Dict[str, float]:
+    """Compute metrics for all tasks"""
+    predictions = eval_pred.predictions
+    labels = eval_pred.label_ids
+
+    metrics = {}
+
+    # Unpack predictions and labels
+    if len(predictions) == 3:
+        ser_preds, asr_preds, prosody_preds = predictions
     else:
-        # Original config for standard training
-        config = MTLConfig(
-            backbone_name=args.backbone,
-            vocab_size=tokenizer.get_vocab_size(),
-            emotion_classes=9,
-            prosody_classes=2,
-            loss_weights={
-                'asr': 0.3,
-                'prosody': 0.3,
-                'ser': 0.4
-            },
-        )
-    return config
+        logger.warning(
+            f"Unexpected prediction format: {len(predictions)} elements")
+        return metrics
+
+    if isinstance(labels, tuple) and len(labels) == 3:
+        asr_labels_info, ser_labels, prosody_labels = labels
+        if isinstance(asr_labels_info, tuple):
+            asr_labels, asr_lengths = asr_labels_info
+        else:
+            asr_labels = asr_labels_info
+            asr_lengths = None
+    else:
+        logger.warning(f"Unexpected label format")
+        return metrics
+
+    # 1. SER metrics (emotion classification)
+    if ser_preds is not None and ser_labels is not None:
+        ser_predictions = np.argmax(ser_preds, axis=-1)
+        ser_accuracy = accuracy_score(ser_labels, ser_predictions)
+        ser_f1 = f1_score(ser_labels, ser_predictions, average='weighted')
+
+        metrics['ser_accuracy'] = ser_accuracy
+        metrics['ser_f1'] = ser_f1
+
+    # 2. ASR metrics (if tokenizer provided and jiwer available)
+    if asr_preds is not None and asr_labels is not None and tokenizer is not None and wer is not None:
+        # Decode predictions
+        asr_predictions = np.argmax(asr_preds, axis=-1)
+
+        # Simple greedy decoding (you might want to use CTC decoder)
+        pred_texts = []
+        ref_texts = []
+
+        for i in range(len(asr_predictions)):
+            # Decode prediction
+            pred_ids = asr_predictions[i]
+            # Remove repetitions and blank tokens
+            decoded_ids = []
+            prev_id = -1
+            for id in pred_ids:
+                if id != 0 and id != prev_id:  # 0 is blank token
+                    decoded_ids.append(id)
+                prev_id = id
+
+            pred_text = tokenizer.decode(decoded_ids, skip_special_tokens=True)
+            pred_texts.append(pred_text)
+
+            # Decode reference
+            if asr_lengths is not None:
+                ref_ids = asr_labels[i][:asr_lengths[i]] if i < len(
+                    asr_lengths) else asr_labels[i]
+            else:
+                ref_ids = asr_labels[i]
+            ref_ids = ref_ids[ref_ids != -100]  # Remove padding
+            ref_text = tokenizer.decode(
+                ref_ids.tolist(), skip_special_tokens=True)
+            ref_texts.append(ref_text)
+
+        # Compute WER and CER
+        word_error_rate = wer(ref_texts, pred_texts)
+        char_error_rate = cer(ref_texts, pred_texts)
+
+        metrics['asr_wer'] = word_error_rate
+        metrics['asr_cer'] = char_error_rate
+
+    # 3. Prosody metrics (binary sequence classification)
+    if prosody_preds is not None and prosody_labels is not None:
+        # Flatten predictions and labels
+        prosody_predictions = (prosody_preds > 0).astype(float).flatten()
+        prosody_labels_flat = prosody_labels.flatten()
+
+        # Remove padding (assuming -100 or negative values are padding)
+        mask = prosody_labels_flat >= 0
+        if mask.sum() > 0:
+            prosody_predictions_masked = prosody_predictions[mask]
+            prosody_labels_masked = prosody_labels_flat[mask]
+
+            prosody_accuracy = accuracy_score(
+                prosody_labels_masked, prosody_predictions_masked)
+            prosody_f1 = f1_score(prosody_labels_masked,
+                                  prosody_predictions_masked, average='binary')
+
+            metrics['prosody_accuracy'] = prosody_accuracy
+            metrics['prosody_f1'] = prosody_f1
+
+    return metrics
 
 
-def create_data_loaders(dataset_dict, config, tokenizer, feature_extractor, batch_size):
-    """Create train, validation, and test data loaders"""
-    # Create datasets
-    train_dataset = MTLDataset(
-        dataset_dict['train'],
-        config=config,
-        feature_extractor=feature_extractor
-    )
+def load_datasets(data_args: DataArguments) -> Dict[str, List[Dict]]:
+    """Load datasets from JSONL files"""
+    import json
 
-    val_dataset = MTLDataset(
-        dataset_dict['val'],
-        config=config,
-        feature_extractor=feature_extractor
-    )
+    datasets_dict = {}
 
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=lambda batch: collate_fn_mtl(
-            batch,
-            pad_token_id=tokenizer.pad_id,
-            tokenizer=tokenizer,
-            backbone_name=config.backbone_name
-        ),
-        num_workers=0,
-        pin_memory=False
-    )
+    # Load training data
+    with open(data_args.train_json, 'r') as f:
+        train_data = [json.loads(line) for line in f]
+    datasets_dict['train'] = train_data
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=lambda batch: collate_fn_mtl(
-            batch,
-            pad_token_id=tokenizer.pad_id,
-            tokenizer=tokenizer,
-            backbone_name=config.backbone_name
-        ),
-        num_workers=0,
-        pin_memory=False
-    )
+    # Load validation data
+    with open(data_args.val_json, 'r') as f:
+        val_data = [json.loads(line) for line in f]
+    datasets_dict['validation'] = val_data
 
-    return train_loader, val_loader
+    # Load test data if provided
+    if data_args.test_json:
+        with open(data_args.test_json, 'r') as f:
+            test_data = [json.loads(line) for line in f]
+        datasets_dict['test'] = test_data
+
+    # Update audio paths
+    for split in datasets_dict:
+        for item in datasets_dict[split]:
+            item['audio_filepath'] = os.path.join(
+                data_args.audio_base_path, item['audio_filepath'])
+
+    return datasets_dict
 
 
 def main():
-    """Main training function"""
-    args = parse_arguments()
+    # Parse arguments
+    parser = HfArgumentParser(
+        (ModelArguments, DataArguments, TrainingArguments))
 
-    # Print configuration
-    print("\n" + "="*50)
-    print("TRAINING CONFIGURATION")
-    print("="*50)
-
-    # Calculate effective batch size
-    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
-    print(f"Per-GPU batch size: {args.batch_size}")
-    print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
-    print(f"Effective batch size: {effective_batch_size}")
-    print(f"Enhanced training: {args.use_enhanced_training}")
-
-    if args.use_enhanced_training:
-        print(f"\nFreeze/Unfreeze Strategy:")
-        print(
-            f"  Initial state: {'Frozen' if args.freeze_encoder_initially else 'Unfrozen'}")
-        print(
-            f"  Unfreeze at: {int(args.num_epochs * args.unfreeze_epoch_ratio)} epochs")
-        print(f"  LR reduction: {args.lr_reduction_factor}x")
-        print(f"\nCTC Configuration:")
-        print(f"  Entropy weight: {args.ctc_entropy_weight}")
-        print(f"  Blank weight: {args.ctc_blank_weight}")
-        print(f"  ASR LR multiplier: {args.asr_lr_multiplier}")
-
-    # Calculate adjusted learning rate
-    base_lr = args.lr
-    if args.scale_lr_with_accumulation and args.gradient_accumulation_steps > 1:
-        lr_scale = math.sqrt(args.gradient_accumulation_steps)
-        adjusted_lr = base_lr * lr_scale
-        print(f"\nBase learning rate: {base_lr}")
-        print(f"Adjusted learning rate: {adjusted_lr}")
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        # Load from json file
+        model_args, data_args, training_args = parser.parse_json_file(
+            json_file=os.path.abspath(sys.argv[1]))
     else:
-        adjusted_lr = base_lr
-        print(f"\nLearning rate: {adjusted_lr}")
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    # Setup device and CUDA
+    # Setup logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log_level = training_args.get_process_log_level()
+    logger.setLevel(log_level)
+    datasets.utils.logging.set_verbosity(log_level)
+
+    # Check GPU availability
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nUsing device: {device}")
-
+    logger.info(f"Using device: {device}")
     if torch.cuda.is_available():
-        configure_cuda_memory()
-        torch.backends.cudnn.benchmark = True
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"Number of GPUs available: {torch.cuda.device_count()}")
 
-    print_memory_usage("\nInitial memory usage:")
+    # Log arguments
+    logger.info(f"Training/evaluation parameters {training_args}")
+    logger.info(f"Model parameters {model_args}")
+    logger.info(f"Data parameters {data_args}")
 
-    # Initialize wandb if enabled
-    if args.use_wandb:
-        config_dict = vars(args)
-        config_dict['effective_batch_size'] = effective_batch_size
-        wandb.init(project="mtl-speech", config=config_dict)
+    # Detect checkpoint
+    last_checkpoint = None
+    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+            raise ValueError(
+                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+                "Use --overwrite_output_dir to overcome."
+            )
+        elif last_checkpoint is not None:
+            logger.info(
+                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
+                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+            )
 
-    # ============================================================================
-    # PHASE 1: DATA LOADING AND PREPARATION
-    # ============================================================================
-    print("\n" + "="*50)
-    print("PHASE 1: DATA LOADING AND PREPARATION")
-    print("="*50)
+    # Set seed
+    set_seed(training_args.seed)
+    logger.info(f"Set random seed to {training_args.seed}")
 
     # Load datasets
-    dataset_dict = load_and_prepare_datasets(
-        args.train_jsonl, args.val_jsonl, args.test_jsonl, args.audio_base_path
-    )
+    logger.info("Stage 1/6: Loading datasets...")
+    datasets_dict = load_datasets(data_args)
+    logger.info(f"Loaded {len(datasets_dict['train'])} training samples")
+    logger.info(
+        f"Loaded {len(datasets_dict['validation'])} validation samples")
 
-    print(f"\nLoaded datasets:")
-    print(f"  Train: {len(dataset_dict['train'])} samples")
-    print(f"  Val: {len(dataset_dict['val'])} samples")
-    print(f"  Test: {len(dataset_dict['test'])} samples")
+    # Load processor and tokenizer based on model type
+    logger.info("Stage 2/6: Loading processor and tokenizer...")
+    logger.info(f"Loading processor for {model_args.backbone_name}")
 
-    # Setup tokenizer
-    if args.retrain_tokenizer or args.tokenizer_path is None:
-        print("\nTraining new SentencePiece tokenizer...")
-        tokenizer = setup_tokenizer_and_dataset(
-            dataset_dict, vocab_size=args.vocab_size
+    # Try to load processor first, then feature extractor
+    try:
+        processor = AutoProcessor.from_pretrained(
+            model_args.backbone_name,
+            cache_dir=model_args.cache_dir
         )
-    else:
-        print(f"\nLoading existing tokenizer from {args.tokenizer_path}")
-        tokenizer = SentencePieceTokenizer(model_path=args.tokenizer_path)
+    except:
+        processor = AutoFeatureExtractor.from_pretrained(
+            model_args.backbone_name,
+            cache_dir=model_args.cache_dir
+        )
+
+    # Load or create tokenizer
+    tokenizer_path = os.path.join("akan_mtl_tokenizer.model")
+    if os.path.exists(tokenizer_path):
+        logger.info(f"Loading existing tokenizer from {tokenizer_path}")
+        tokenizer = SentencePieceTokenizer(model_path=tokenizer_path)
         tokenizer.load_tokenizer()
+    else:
+        logger.info("Creating new tokenizer")
+        # Extract all text for tokenizer training
+        all_texts = []
+        for split in datasets_dict:
+            for item in datasets_dict[split]:
+                if 'words' in item:
+                    all_texts.append(" ".join(item['words']))
 
-    print(f"Tokenizer vocabulary size: {tokenizer.get_vocab_size()}")
-    print(f"Tokenizer blank ID: {tokenizer.blank_id}")
+        # Train tokenizer
+        os.makedirs(tokenizer_path, exist_ok=True)
+        text_file = os.path.join(tokenizer_path, "training_text.txt")
+        with open(text_file, 'w') as f:
+            for text in all_texts:
+                f.write(text + '\n')
 
-    # ============================================================================
-    # PHASE 2: MODEL SETUP
-    # ============================================================================
-    print("\n" + "="*50)
-    print("PHASE 2: MODEL SETUP")
-    print("="*50)
+        tokenizer = SentencePieceTokenizer(vocab_size=model_args.vocab_size)
+        tokenizer.train_tokenizer(
+            text_file, model_prefix=os.path.join(tokenizer_path, "spm"))
 
-    # Setup configuration
-    config = setup_config(args, tokenizer)
+    # Parse emotion label map if provided
+    emotion_label_map = None
+    if data_args.emotion_label_map:
+        emotion_label_map = json.loads(data_args.emotion_label_map)
 
-    # Create model
-    model = MTLModel(
-        config=config,
-        use_asr=True,
-        use_prosody=True,
-        use_ser=True,
-        tokenizer=tokenizer
-    ).to(device)
-
-    print(f"\nCreated MTL model with backbone: {args.backbone}")
-    print(f"Active heads: {model.get_active_heads()}")
-
-    # Apply memory optimizations
-    model = optimize_model_for_memory(model)
-    print_memory_usage("\nAfter model creation:")
-
-    # Create feature extractor
-    temp_backbone = BackboneModel(config.backbone_config)
-    feature_extractor = temp_backbone.feature_extractor
-    del temp_backbone
-    cleanup_memory()
-
-    # Create data loaders
-    train_loader, val_loader = create_data_loaders(
-        dataset_dict, config, tokenizer, feature_extractor, args.batch_size
+    # Create datasets
+    logger.info("Stage 3/6: Creating datasets...")
+    train_dataset = MTLDataset(
+        datasets_dict['train'],
+        processor=processor,
+        target_sr=16000,
+        max_duration=data_args.max_duration_in_seconds,
+        emotion_label_map=emotion_label_map
     )
 
-    print_memory_usage("\nAfter data loader creation:")
+    val_dataset = MTLDataset(
+        datasets_dict['validation'],
+        processor=processor,
+        target_sr=16000,
+        max_duration=data_args.max_duration_in_seconds,
+        emotion_label_map=emotion_label_map
+    )
 
-    # ============================================================================
-    # PHASE 3: TRAINING
-    # ============================================================================
-    print("\n" + "="*50)
-    print("PHASE 3: TRAINING")
-    print("="*50)
+    # Create data collator
+    data_collator = DataCollatorMTLWithPadding(
+        processor=processor,
+        tokenizer=tokenizer,
+        padding=True,
+        return_attention_mask=True
+    )
+
+    # Create model configuration
+    logger.info("Stage 4/6: Creating model configuration...")
+    config = MTLConfig(
+        backbone_name=model_args.backbone_name,
+        vocab_size=tokenizer.get_vocab_size(),
+        emotion_classes=model_args.emotion_classes,
+        alpha_asr=model_args.alpha_asr,
+        alpha_prosody=model_args.alpha_prosody,
+        freeze_encoder=model_args.freeze_feature_extractor
+    )
+
+    # Create or load model
+    logger.info("Stage 5/6: Creating/loading model...")
+    if last_checkpoint is not None:
+        logger.info(f"Loading model from checkpoint {last_checkpoint}")
+        model = MTLModel.from_pretrained(last_checkpoint, config=config)
+    else:
+        logger.info("Creating new model")
+        model = MTLModel(config)
+
+        if model_args.freeze_feature_extractor:
+            model.freeze_feature_extractor()
+
+    # Move model to GPU if available
+    model = model.to(device)
+
+    # Log model info
+    logger.info(
+        f"Model created with {model.num_parameters(only_trainable=True):,} trainable parameters")
+    logger.info(
+        f"Total parameters: {model.num_parameters(only_trainable=False):,}")
 
     # Create trainer
+    logger.info("Stage 6/6: Setting up trainer...")
     trainer = MTLTrainer(
-        model,
-        device=device,
-        use_wandb=args.use_wandb,
-        use_amp=args.use_amp,
-        gradient_accumulation_steps=args.gradient_accumulation_steps
+        model=model,
+        args=training_args,
+        data_collator=data_collator,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=val_dataset if training_args.do_eval else None,
+        tokenizer=processor,
+        compute_metrics=lambda eval_pred: compute_metrics(
+            eval_pred, tokenizer),
     )
 
-    print("\nStarting training...")
+    # Training
+    if training_args.do_train:
+        logger.info("Starting training...")
+        checkpoint = None
+        if training_args.resume_from_checkpoint is not None:
+            checkpoint = training_args.resume_from_checkpoint
+        elif last_checkpoint is not None:
+            checkpoint = last_checkpoint
 
-    if args.use_enhanced_training:
-        # Use enhanced training with freeze/unfreeze strategy
-        trainer.train_with_freeze_unfreeze(
-            train_loader=train_loader,
-            val_loader=val_loader,
-            num_epochs=args.num_epochs,
-            tokenizer=tokenizer,
-            base_lr=adjusted_lr,
-            save_dir=args.save_dir,
-            early_stopping_patience=args.early_stopping_patience,
-            checkpoint_interval=args.checkpoint_interval,
-            unfreeze_epoch_ratio=args.unfreeze_epoch_ratio,
-            lr_reduction_factor=args.lr_reduction_factor,
-            dynamic_loss_weights=True
-        )
-    else:
-        # Use original training method
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=adjusted_lr,
-            weight_decay=0.01,
-            eps=1e-8,
-            betas=(0.9, 0.999)
-        )
+        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        trainer.save_model()
 
-        # Initialize scheduler if requested
-        scheduler = None
-        if args.use_scheduler:
-            steps_per_epoch = len(
-                train_loader) // args.gradient_accumulation_steps
-            total_steps = steps_per_epoch * args.num_epochs
-            scheduler = CosineAnnealingLR(
-                optimizer,
-                T_max=total_steps,
-                eta_min=1e-6
-            )
-            print(
-                f"Using cosine annealing scheduler with {total_steps} total steps")
+        # Save metrics
+        metrics = train_result.metrics
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
 
-        trainer.train(
-            train_loader=train_loader,
-            val_loader=val_loader,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            num_epochs=args.num_epochs,
-            tokenizer=tokenizer,
-            save_dir=args.save_dir,
-            early_stopping_patience=args.early_stopping_patience,
-            checkpoint_interval=args.checkpoint_interval
+        logger.info("Training completed!")
+
+    # Evaluation
+    if training_args.do_eval:
+        logger.info("Starting evaluation...")
+        metrics = trainer.evaluate()
+
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+        logger.info("Evaluation completed!")
+
+    # Test evaluation
+    if training_args.do_predict and data_args.test_json:
+        logger.info("Starting test evaluation...")
+        test_dataset = MTLDataset(
+            datasets_dict['test'],
+            processor=processor,
+            target_sr=16000,
+            max_duration=data_args.max_duration_in_seconds,
+            emotion_label_map=emotion_label_map
         )
 
-    print_memory_usage("\nAfter training:")
+        predictions, labels, metrics = trainer.predict(
+            test_dataset, metric_key_prefix="test")
 
-    # Clean up training data before test evaluation
-    del train_loader, val_loader
-    cleanup_memory()
-
-    # Plot training history
-    if args.use_enhanced_training:
-        plot_enhanced_training_history(
-            trainer.history,
-            os.path.join(args.save_dir, 'training_history.png')
-        )
-    else:
-        plot_training_history(
-            trainer.history,
-            os.path.join(args.save_dir, 'training_history.png')
-        )
-
-    print("\nTraining completed!")
-
-    # ============================================================================
-    # PHASE 4: TEST EVALUATION
-    # ============================================================================
-    print("\n" + "="*50)
-    print("PHASE 4: TEST EVALUATION")
-    print("="*50)
-
-    # Create test dataset and loader
-    test_dataset = MTLDataset(
-        dataset_dict['test'],
-        config=config,
-        feature_extractor=feature_extractor
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=lambda batch: collate_fn_mtl(
-            batch,
-            pad_token_id=tokenizer.pad_id,
-            tokenizer=tokenizer,
-            backbone_name=config.backbone_name
-        ),
-        num_workers=0,
-        pin_memory=False
-    )
-
-    # Load best model
-    print("\nLoading best model for evaluation...")
-    trainer.load_checkpoint(os.path.join(args.save_dir, 'best_model.pt'))
-
-    # Evaluate on test set
-    evaluator = MTLEvaluator(model, tokenizer, device,
-                             use_amp=args.use_amp, decode_method='beam')
-    test_metrics = evaluator.evaluate(test_loader)
-    evaluator.print_detailed_results(test_metrics)
-
-    # Save results
-    with open(os.path.join(args.save_dir, 'test_results.json'), 'w', encoding='utf-8') as f:
-        json.dump(test_metrics, f, indent=4, cls=NumpyEncoder)
-
-    print_memory_usage("\nFinal memory usage:")
-
-    print("\n" + "="*50)
-    print("TRAINING AND EVALUATION COMPLETED!")
-    print("="*50)
-
-    # Finish wandb run
-    if args.use_wandb:
-        wandb.config.update({
-            "effective_batch_size": effective_batch_size,
-            "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            "per_gpu_batch_size": args.batch_size,
-            "learning_rate": adjusted_lr,
-            "base_learning_rate": base_lr,
-            "use_scheduler": args.use_scheduler,
-            "enhanced_training": args.use_enhanced_training
-        })
-
-        if args.use_enhanced_training:
-            wandb.config.update({
-                "freeze_encoder_initially": args.freeze_encoder_initially,
-                "unfreeze_epoch_ratio": args.unfreeze_epoch_ratio,
-                "lr_reduction_factor": args.lr_reduction_factor,
-                "ctc_entropy_weight": args.ctc_entropy_weight,
-                "ctc_blank_weight": args.ctc_blank_weight,
-                "asr_lr_multiplier": args.asr_lr_multiplier
-            })
-
-        wandb.finish()
+        trainer.log_metrics("test", metrics)
+        trainer.save_metrics("test", metrics)
+        logger.info("Test evaluation completed!")
 
 
 if __name__ == "__main__":

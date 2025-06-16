@@ -1,9 +1,8 @@
 from transformers import (
     AutoFeatureExtractor,
     AutoModel,
-    WhisperModel,
-    Wav2Vec2Model,
-    Wav2Vec2BertModel
+    AutoConfig,
+    AutoProcessor
 )
 from typing import Dict, Optional, Union
 import torch
@@ -54,11 +53,22 @@ BACKBONE_CONFIGS = {
 
 
 class BackboneModel(nn.Module):
-    """Wrapper class for different backbone models"""
+    """Wrapper class for different backbone models using AutoClasses"""
 
     def __init__(self, config: BackboneConfig):
         super().__init__()
         self.config = config
+        
+        # Load configuration first to get actual hidden size
+        self.model_config = AutoConfig.from_pretrained(
+            config.pretrained_model_name,
+            trust_remote_code=False
+        )
+        
+        # Update hidden size from actual config
+        self._update_hidden_size_from_config()
+        
+        # Load model and feature extractor using AutoClasses
         self.model = self._load_model()
         self.feature_extractor = self._load_feature_extractor()
 
@@ -68,52 +78,50 @@ class BackboneModel(nn.Module):
         if config.freeze_encoder:
             self.freeze_encoder()
 
+    def _update_hidden_size_from_config(self):
+        """Update hidden size from the actual model configuration"""
+        if hasattr(self.model_config, 'hidden_size'):
+            self.config.hidden_size = self.model_config.hidden_size
+        elif hasattr(self.model_config, 'd_model'):
+            self.config.hidden_size = self.model_config.d_model
+        elif hasattr(self.model_config, 'encoder_embed_dim'):
+            self.config.hidden_size = self.model_config.encoder_embed_dim
+        # Keep original if none found
+
     def get_hidden_size(self) -> int:
         """Get the hidden size of the backbone model"""
         return self.config.hidden_size
 
     def _load_model(self) -> nn.Module:
-        """Load the appropriate model based on configuration"""
-        # Common kwargs to prefer safetensors format
+        """Load model using AutoModel"""
         load_kwargs = {
-            "use_safetensors": True,  # Prefer safetensors format
-            "trust_remote_code": False,  # Security best practice
+            "use_safetensors": True,
+            "trust_remote_code": False,
         }
 
         try:
-            if self.config.model_name == "whisper":
-                return WhisperModel.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
-            elif self.config.model_name == "xlsr":
-                return Wav2Vec2Model.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
-            elif self.config.model_name == "mms":
-                return Wav2Vec2Model.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
-            elif self.config.model_name == "wav2vec2-bert":
-                return Wav2Vec2BertModel.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
-            else:
-                raise ValueError(
-                    f"Unsupported model name: {self.config.model_name}")
+            return AutoModel.from_pretrained(
+                self.config.pretrained_model_name,
+                **load_kwargs
+            )
         except Exception as e:
             if "safetensors" in str(e):
-                # If safetensors not available, try without it but warn the user
                 print(f"Warning: SafeTensors format not available for {self.config.pretrained_model_name}. "
-                      f"Consider upgrading torch to >=2.6 or using a different model.")
-                # Remove use_safetensors and retry
+                      f"Falling back to standard format.")
                 load_kwargs.pop("use_safetensors", None)
-
-                if self.config.model_name == "whisper":
-                    return WhisperModel.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
-                elif self.config.model_name == "xlsr":
-                    return Wav2Vec2Model.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
-                elif self.config.model_name == "mms":
-                    return Wav2Vec2Model.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
-                elif self.config.model_name == "wav2vec2-bert":
-                    return Wav2Vec2BertModel.from_pretrained(self.config.pretrained_model_name, **load_kwargs)
+                return AutoModel.from_pretrained(
+                    self.config.pretrained_model_name,
+                    **load_kwargs
+                )
             else:
                 raise e
 
     def _load_feature_extractor(self):
-        """Load the appropriate feature extractor"""
-        return AutoFeatureExtractor.from_pretrained(self.config.pretrained_model_name)
+        """Load feature extractor using AutoFeatureExtractor"""
+        return AutoFeatureExtractor.from_pretrained(
+            self.config.pretrained_model_name,
+            trust_remote_code=False
+        )
 
     def freeze_encoder(self):
         """Freeze the encoder parameters"""
@@ -143,28 +151,36 @@ class BackboneModel(nn.Module):
     
     def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         """Forward pass through the backbone model"""
-        if self.config.model_name == "whisper":
-            outputs = self.model.encoder(input_features)
+        # Use AutoModel's forward method - it handles different architectures automatically
+        outputs = self.model(input_features, output_hidden_states=True)
+        
+        # Extract last hidden state based on model type
+        if hasattr(outputs, 'last_hidden_state'):
             return outputs.last_hidden_state
-        elif self.config.model_name in ["xlsr", "mms", "wav2vec2-bert"]:
-            outputs = self.model(input_features)
-            return outputs.last_hidden_state
+        elif hasattr(outputs, 'hidden_states') and outputs.hidden_states:
+            return outputs.hidden_states[-1]
         else:
-            raise ValueError(
-                f"Unsupported model name: {self.config.model_name}")
+            # Fallback for older model formats
+            if self.config.model_name == "whisper" and hasattr(self.model, 'encoder'):
+                encoder_outputs = self.model.encoder(input_features)
+                return encoder_outputs.last_hidden_state
+            else:
+                raise ValueError(f"Could not extract features from {self.config.model_name}")
 
     def extract_features(self, audio_array: torch.Tensor, sampling_rate: int = 16000) -> torch.Tensor:
         """Extract features from audio using the feature extractor"""
+        # This method is now primarily for compatibility
+        # Feature extraction should be handled in collate_fn as requested
         features = self.feature_extractor(
             audio_array,
             sampling_rate=sampling_rate,
             return_tensors="pt"
         )
 
-        if self.config.model_name in ["whisper", "wav2vec2-bert"]:
+        # Return appropriate feature type based on model
+        if hasattr(features, 'input_features'):
             return features.input_features.squeeze(0)
-        elif self.config.model_name in ["xlsr", "mms"]:
+        elif hasattr(features, 'input_values'):
             return features.input_values.squeeze(0)
         else:
-            raise ValueError(
-                f"Unsupported model name: {self.config.model_name}")
+            raise ValueError(f"Unsupported feature format for {self.config.model_name}")
