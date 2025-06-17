@@ -2,38 +2,35 @@ import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Optional, Union, Any
 import numpy as np
-import librosa
-import soundfile as sf
 from transformers import AutoProcessor, AutoFeatureExtractor
+
+from contextlib import nullcontext
 
 
 class MTLDataset(Dataset):
     """
-    Improved dataset following the paper's approach.
-    Handles audio loading and basic preprocessing.
+    Improved dataset that works with preprocessed audio data.
+    Much more memory efficient as audio is already loaded and processed.
     """
-    
+
     def __init__(
         self,
         data_list: List[Dict],
-        processor: Union[AutoProcessor, AutoFeatureExtractor],
-        target_sr: int = 16000,
-        max_duration: Optional[float] = None,
+        config,
+        feature_extractor: Union[AutoProcessor, AutoFeatureExtractor],
         emotion_label_map: Optional[Dict[str, int]] = None
     ):
         """
         Args:
-            data_list: List of data samples with audio paths and labels
-            processor: HuggingFace processor/feature extractor
-            target_sr: Target sampling rate
-            max_duration: Maximum audio duration in seconds
+            data_list: List of data samples with preprocessed audio
+            config: MTLConfig object
+            feature_extractor: HuggingFace processor/feature extractor
             emotion_label_map: Mapping from emotion strings to integers
         """
         self.data_list = data_list
-        self.processor = processor
-        self.target_sr = target_sr
-        self.max_duration = max_duration
-        
+        self.config = config
+        self.feature_extractor = feature_extractor
+
         # Default emotion mapping if not provided
         if emotion_label_map is None:
             self.emotion_label_map = {
@@ -42,74 +39,97 @@ class MTLDataset(Dataset):
             }
         else:
             self.emotion_label_map = emotion_label_map
-        
-        # Filter by duration if needed
-        if max_duration is not None:
-            self.data_list = self._filter_by_duration()
-    
-    def _filter_by_duration(self) -> List[Dict]:
-        """Filter samples by maximum duration"""
-        filtered = []
+
+        print(f"Created dataset with {len(self.data_list)} samples")
+
+        # Verify data structure
+        print("\nVerifying data structure...")
+        sample = self.data_list[0]
+        print("Available keys in data:", list(sample.keys()))
+
+        # Verify emotion labels
+        emotion_counts = {}
         for item in self.data_list:
-            try:
-                info = sf.info(item['audio_filepath'])
-                duration = info.duration
-                if duration <= self.max_duration:
-                    filtered.append(item)
-            except:
-                # If we can't read the file info, skip it
-                continue
-        
-        print(f"Filtered {len(self.data_list) - len(filtered)} samples exceeding {self.max_duration}s")
-        return filtered
-    
+            emotion = item.get('emotion', 'Unknown')
+            emotion_counts[emotion] = emotion_counts.get(emotion, 0) + 1
+
+        print("\nEmotion label distribution:")
+        for emotion, count in emotion_counts.items():
+            print(f"  {emotion}: {count} samples")
+
+        # Verify prosody annotations
+        prosody_count = sum(
+            1 for item in self.data_list if 'prosody_annotations' in item)
+        print(
+            f"\nSamples with prosody annotations: {prosody_count}/{len(self.data_list)}")
+
     def __len__(self) -> int:
         return len(self.data_list)
-    
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
-        Get a single sample.
-        
-        Returns:
-            Dictionary with:
-                - speech: raw audio array
-                - sampling_rate: audio sampling rate
-                - text: transcription text
-                - emotion: emotion label (integer)
-                - prosody: prosody labels (list of 0/1)
-                - words: list of words
+        Get a single sample with preprocessed audio.
         """
         item = self.data_list[idx]
-        
-        # Load audio
-        speech, sr = librosa.load(item['audio_filepath'], sr=self.target_sr)
-        
+
+        # Get preprocessed audio data
+        speech = item['audio_data']
+        sr = item.get('audio_sr', 16000)  # Default to 16kHz if not specified
+
+        # Ensure speech is numpy array
+        if not isinstance(speech, np.ndarray):
+            speech = np.array(speech, dtype=np.float32)
+
+        # Process through feature extractor
+        if hasattr(self.feature_extractor, 'feature_extractor'):
+            # For models with separate feature extractor
+            features = self.feature_extractor.feature_extractor(
+                speech,
+                sampling_rate=sr,
+                return_tensors="pt"
+            )
+        else:
+            # For models with unified processor
+            features = self.feature_extractor(
+                speech,
+                sampling_rate=sr,
+                return_tensors="pt"
+            )
+
+        # Extract the appropriate feature type
+        if "input_values" in features:
+            input_features = features.input_values.squeeze(0)
+        elif "input_features" in features:
+            input_features = features.input_features.squeeze(0)
+        else:
+            raise ValueError("Unknown feature format")
+
         # Get labels
         text = " ".join(item['words']) if 'words' in item else ""
-        emotion = self.emotion_label_map.get(item['emotion'], item['emotion'])
-        
+        # Use emotion value directly since it's already encoded
+        emotion = item['emotion']
+
         # Handle prosody annotations
         prosody = item.get('prosody_annotations', [])
         if not isinstance(prosody, list):
             prosody = [prosody]
-        
+
         return {
-            'speech': speech,
-            'sampling_rate': sr,
-            'text': text,
+            'input_features': input_features,
+            'asr_target': item.get('words', []),
+            'emotion_targets': emotion,
+            'prosody_targets': torch.tensor(prosody, dtype=torch.float32),
             'words': item.get('words', []),
-            'emotion': emotion,
-            'prosody': prosody,
-            'audio_path': item['audio_filepath']
+            'audio_duration': item.get('audio_duration', len(speech) / sr)
         }
 
 
 class DataCollatorMTLWithPadding:
     """
-    Data collator for multi-task learning following the paper's approach.
-    Handles padding and processing for all three tasks.
+    Data collator for multi-task learning that works with preprocessed features.
+    Compatible with the updated MTLDataset that returns already extracted features.
     """
-    
+
     def __init__(
         self,
         processor: Union[AutoProcessor, AutoFeatureExtractor],
@@ -125,127 +145,167 @@ class DataCollatorMTLWithPadding:
         self.max_length = max_length
         self.pad_to_multiple_of = pad_to_multiple_of
         self.return_attention_mask = return_attention_mask
-    
+
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """
-        Collate batch of samples.
-        
+        Collate batch of samples with preprocessed features.
+
         Args:
-            features: List of samples from dataset
-            
+            features: List of samples from MTLDataset (with input_features already extracted)
+
         Returns:
             Dictionary with batched tensors
         """
-        # Extract audio arrays and sampling rates
-        speech_list = [feature["speech"] for feature in features]
-        sampling_rates = [feature["sampling_rate"] for feature in features]
-        
-        # Check all have same sampling rate
-        assert len(set(sampling_rates)) == 1, "All samples must have same sampling rate"
-        
-        # Process audio through feature extractor
-        if hasattr(self.processor, 'feature_extractor'):
-            # For models with separate feature extractor (e.g., Wav2Vec2)
-            audio_features = self.processor.feature_extractor(
-                speech_list,
-                sampling_rate=sampling_rates[0],
-                padding=self.padding,
-                max_length=self.max_length,
-                pad_to_multiple_of=self.pad_to_multiple_of,
-                return_tensors="pt",
-                return_attention_mask=self.return_attention_mask
-            )
-        else:
-            # For models with unified processor (e.g., Whisper)
-            audio_features = self.processor(
-                speech_list,
-                sampling_rate=sampling_rates[0],
-                padding=self.padding,
-                max_length=self.max_length,
-                pad_to_multiple_of=self.pad_to_multiple_of,
-                return_tensors="pt",
-                return_attention_mask=self.return_attention_mask
-            )
-        
         # Prepare batch dictionary
         batch = {}
-        
-        # Add audio features (input_values or input_features depending on model)
-        if "input_values" in audio_features:
-            batch["input_values"] = audio_features.input_values
-        elif "input_features" in audio_features:
-            batch["input_features"] = audio_features.input_features
-        
-        if self.return_attention_mask and "attention_mask" in audio_features:
-            batch["attention_mask"] = audio_features.attention_mask
-        
+
+        # Extract input features (already preprocessed by MTLDataset)
+        input_features_list = [feature["input_features"]
+                               for feature in features]
+
+        # Determine the type of features and pad accordingly
+        # 2D features (e.g., mel-spectrogram for Whisper)
+        if len(input_features_list[0].shape) == 2:
+            # Find max dimensions
+            max_freq = max(feat.shape[0] for feat in input_features_list)
+            max_time = max(feat.shape[1] for feat in input_features_list)
+
+            # Create padded tensor
+            batch_size = len(features)
+            padded_features = torch.zeros(batch_size, max_freq, max_time)
+            attention_mask = torch.zeros(
+                batch_size, max_time) if self.return_attention_mask else None
+
+            # Fill with actual features
+            for i, feat in enumerate(input_features_list):
+                freq_dim, time_dim = feat.shape
+                padded_features[i, :freq_dim, :time_dim] = feat
+                if attention_mask is not None:
+                    attention_mask[i, :time_dim] = 1
+
+            batch["input_features"] = padded_features
+
+        # 1D features (e.g., raw waveform for wav2vec2)
+        elif len(input_features_list[0].shape) == 1:
+            # Pad sequences
+            max_length = max(feat.shape[0] for feat in input_features_list)
+
+            # Apply pad_to_multiple_of if specified
+            if self.pad_to_multiple_of is not None:
+                max_length = ((max_length + self.pad_to_multiple_of - 1) //
+                              self.pad_to_multiple_of) * self.pad_to_multiple_of
+
+            batch_size = len(features)
+            padded_features = torch.zeros(batch_size, max_length)
+            attention_mask = torch.ones(
+                batch_size, max_length) if self.return_attention_mask else None
+
+            # Fill with actual features
+            for i, feat in enumerate(input_features_list):
+                length = feat.shape[0]
+                padded_features[i, :length] = feat
+                if attention_mask is not None:
+                    attention_mask[i, length:] = 0
+
+            batch["input_values"] = padded_features
+
+        else:
+            raise ValueError(
+                f"Unexpected feature shape: {input_features_list[0].shape}")
+
+        if self.return_attention_mask and attention_mask is not None:
+            batch["attention_mask"] = attention_mask
+
         # Process labels for each task
         # 1. ASR labels (CTC)
         if self.tokenizer is not None:
-            texts = [feature["text"] for feature in features]
-            
+            # Get text from words
+            texts = []
+            for feature in features:
+                words = feature.get("asr_target", feature.get("words", []))
+                text = " ".join(words) if isinstance(
+                    words, list) else str(words)
+                texts.append(text)
+
             # Tokenize texts
-            with self.processor.as_target_processor() if hasattr(self.processor, 'as_target_processor') else nullcontext():
-                text_features = self.tokenizer(
-                    texts,
-                    padding=self.padding,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=self.max_length
+            tokenized = []
+            for text in texts:
+                token_ids = self.tokenizer.encode(
+                    text, add_special_tokens=True)
+                tokenized.append(torch.tensor(token_ids, dtype=torch.long))
+
+            # Pad sequences
+            if tokenized:
+                asr_labels = torch.nn.utils.rnn.pad_sequence(
+                    tokenized, batch_first=True, padding_value=-100
                 )
-            
-            # Replace padding with -100 for CTC loss
-            asr_labels = text_features.input_ids.masked_fill(
-                text_features.attention_mask.ne(1), -100
-            )
-            asr_lengths = text_features.attention_mask.sum(-1)
+                asr_lengths = torch.tensor(
+                    [len(t) for t in tokenized], dtype=torch.long)
+            else:
+                asr_labels = None
+                asr_lengths = None
         else:
             asr_labels = None
             asr_lengths = None
-        
+
         # 2. SER labels (emotion classification)
-        emotion_labels = torch.tensor([feature["emotion"] for feature in features], dtype=torch.long)
-        
+        emotion_labels = torch.tensor(
+            [feature.get("emotion_targets", 0) for feature in features],
+            dtype=torch.long
+        )
+
         # 3. Prosody labels (sequence labeling)
-        # Need to pad prosody sequences to match audio length
         prosody_sequences = []
         for i, feature in enumerate(features):
-            prosody = feature["prosody"]
-            
-            # Determine target length based on audio features
+            # Get prosody targets with default empty list
+            prosody = feature.get("prosody_targets", [])
+
+            # Ensure it's a tensor
+            if not isinstance(prosody, torch.Tensor):
+                prosody = torch.tensor(prosody, dtype=torch.float32)
+
+            # Determine target length based on input features
             if "input_values" in batch:
-                target_len = batch["input_values"].shape[1] // 320  # Approximate frame count
+                # For wav2vec2-like models, approximate frame count
+                target_len = batch["input_values"].shape[1] // 320
             else:
-                target_len = batch["input_features"].shape[-1]  # For spectrogram features
-            
-            # Create prosody tensor with appropriate length
+                # For whisper-like models, use time dimension
+                target_len = batch["input_features"].shape[-1]
+
+            # Adjust prosody length to match target
             if len(prosody) == 0:
                 # No prosody labels, create zeros
-                prosody_tensor = torch.zeros(target_len, dtype=torch.float)
+                prosody_tensor = torch.zeros(target_len, dtype=torch.float32)
             else:
-                # Interpolate prosody to match target length
-                prosody_tensor = torch.tensor(prosody, dtype=torch.float)
+                prosody_tensor = prosody
                 if len(prosody) != target_len:
                     # Simple nearest neighbor interpolation
-                    indices = torch.linspace(0, len(prosody) - 1, target_len).long()
-                    prosody_tensor = prosody_tensor[indices]
-            
+                    if len(prosody) > 0:
+                        indices = torch.linspace(
+                            0, len(prosody) - 1, target_len).long()
+                        indices = torch.clamp(indices, 0, len(prosody) - 1)
+                        prosody_tensor = prosody[indices]
+                    else:
+                        prosody_tensor = torch.zeros(
+                            target_len, dtype=torch.float32)
+
             prosody_sequences.append(prosody_tensor)
-        
+
         # Pad prosody sequences
-        max_prosody_len = max(len(seq) for seq in prosody_sequences)
-        prosody_labels = torch.zeros(len(features), max_prosody_len)
-        for i, seq in enumerate(prosody_sequences):
-            prosody_labels[i, :len(seq)] = seq
-        
+        if prosody_sequences:
+            max_prosody_len = max(len(seq) for seq in prosody_sequences)
+            prosody_labels = torch.zeros(
+                len(features), max_prosody_len, dtype=torch.float32)
+            for i, seq in enumerate(prosody_sequences):
+                prosody_labels[i, :len(seq)] = seq
+        else:
+            prosody_labels = torch.zeros(len(features), 1, dtype=torch.float32)
+
         # Combine labels into tuple (following paper's approach)
         if asr_labels is not None:
-            batch["labels"] = ((asr_labels, asr_lengths), emotion_labels, prosody_labels)
+            batch["labels"] = ((asr_labels, asr_lengths),
+                               emotion_labels, prosody_labels)
         else:
             batch["labels"] = (None, emotion_labels, prosody_labels)
-        
+
         return batch
-
-
-# Utility context manager for cases without target processor
-from contextlib import nullcontext

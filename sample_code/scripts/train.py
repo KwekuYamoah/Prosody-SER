@@ -48,12 +48,15 @@ logger = logging.getLogger(__name__)
 class ModelArguments:
     """Arguments for model configuration"""
     backbone_name: str = field(
+        default="facebook/wav2vec2-base",
+        metadata={"help": "Pretrained model name or path"}
+    )
+    common_backbone_name: str = field(
         default="whisper",
-        metadata={
-            "help": "Pretrained model name  in [whisper, xlsr, mms, wav2vec2-bert]"}
+        metadata={"help": "Common model name"}
     )
     vocab_size: int = field(
-        default=16000,
+        default=4000,
         metadata={"help": "Vocabulary size for ASR"}
     )
     emotion_classes: int = field(
@@ -87,15 +90,17 @@ class DataArguments:
     val_json: str = field(
         metadata={"help": "Path to validation JSONL file"}
     )
-    audio_base_path: str = field(
-        metadata={"help": "Base path for audio files"}
-    )
     test_json: Optional[str] = field(
         default=None,
         metadata={"help": "Path to test JSONL file"}
     )
+    audio_base_path: str = field(
+        default="",
+        metadata={
+            "help": "Base path for audio files (not needed if using preprocessed data)"}
+    )
     max_duration_in_seconds: Optional[float] = field(
-        default=60.0,
+        default=300.0,
         metadata={"help": "Maximum audio duration"}
     )
     preprocessing_num_workers: int = field(
@@ -111,7 +116,7 @@ class DataArguments:
 class MTLTrainer(Trainer):
     """Custom trainer for multi-task learning"""
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """Compute multi-task loss"""
         outputs = model(**inputs)
         loss = outputs.loss if isinstance(outputs, MTLOutput) else outputs[0]
@@ -143,7 +148,7 @@ class MTLTrainer(Trainer):
         return (loss, logits, labels)
 
 
-def compute_metrics(eval_pred: EvalPrediction, tokenizer="akan_mtl_tokenizer.model") -> Dict[str, float]:
+def compute_metrics(eval_pred: EvalPrediction, tokenizer=None) -> Dict[str, float]:
     """Compute metrics for all tasks"""
     predictions = eval_pred.predictions
     labels = eval_pred.label_ids
@@ -242,33 +247,49 @@ def compute_metrics(eval_pred: EvalPrediction, tokenizer="akan_mtl_tokenizer.mod
     return metrics
 
 
-def load_datasets(data_args: DataArguments) -> Dict[str, List[Dict]]:
-    """Load datasets from JSONL files"""
+def load_preprocessed_datasets(data_args: DataArguments) -> Dict[str, List[Dict]]:
+    """Load datasets from preprocessed JSONL files"""
     import json
 
     datasets_dict = {}
 
     # Load training data
+    print(f"Loading preprocessed training data from {data_args.train_json}")
     with open(data_args.train_json, 'r') as f:
-        train_data = [json.loads(line) for line in f]
+        train_data = []
+        for line in f:
+            item = json.loads(line)
+            # Convert audio_data from list back to numpy array if needed
+            if 'audio_data' in item and isinstance(item['audio_data'], list):
+                item['audio_data'] = np.array(
+                    item['audio_data'], dtype=np.float32)
+            train_data.append(item)
     datasets_dict['train'] = train_data
 
     # Load validation data
+    print(f"Loading preprocessed validation data from {data_args.val_json}")
     with open(data_args.val_json, 'r') as f:
-        val_data = [json.loads(line) for line in f]
+        val_data = []
+        for line in f:
+            item = json.loads(line)
+            if 'audio_data' in item and isinstance(item['audio_data'], list):
+                item['audio_data'] = np.array(
+                    item['audio_data'], dtype=np.float32)
+            val_data.append(item)
     datasets_dict['validation'] = val_data
 
     # Load test data if provided
     if data_args.test_json:
+        print(f"Loading preprocessed test data from {data_args.test_json}")
         with open(data_args.test_json, 'r') as f:
-            test_data = [json.loads(line) for line in f]
+            test_data = []
+            for line in f:
+                item = json.loads(line)
+                if 'audio_data' in item and isinstance(item['audio_data'], list):
+                    item['audio_data'] = np.array(
+                        item['audio_data'], dtype=np.float32)
+                test_data.append(item)
         datasets_dict['test'] = test_data
-
-    # Update audio paths
-    for split in datasets_dict:
-        for item in datasets_dict[split]:
-            item['audio_filepath'] = os.path.join(
-                data_args.audio_base_path, item['audio_filepath'])
 
     return datasets_dict
 
@@ -295,13 +316,6 @@ def main():
     logger.setLevel(log_level)
     datasets.utils.logging.set_verbosity(log_level)
 
-    # Check GPU availability
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-    if torch.cuda.is_available():
-        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"Number of GPUs available: {torch.cuda.device_count()}")
-
     # Log arguments
     logger.info(f"Training/evaluation parameters {training_args}")
     logger.info(f"Model parameters {model_args}")
@@ -324,17 +338,30 @@ def main():
 
     # Set seed
     set_seed(training_args.seed)
-    logger.info(f"Set random seed to {training_args.seed}")
+    print(f"\n🎲 Set random seed to {training_args.seed}")
 
     # Load datasets
-    logger.info("Stage 1/6: Loading datasets...")
-    datasets_dict = load_datasets(data_args)
+    logger.info("Loading preprocessed datasets...")
+
+    print("\n" + "="*50)
+    print("📊 Stage 1/6: Loading datasets...")
+    print("="*50)
+
+    datasets_dict = load_preprocessed_datasets(data_args)
     logger.info(f"Loaded {len(datasets_dict['train'])} training samples")
     logger.info(
         f"Loaded {len(datasets_dict['validation'])} validation samples")
 
+    print(f"   ✓ Loaded {len(datasets_dict['train'])} training samples")
+    print(f"   ✓ Loaded {len(datasets_dict['validation'])} validation samples")
+
     # Load processor and tokenizer based on model type
-    logger.info("Stage 2/6: Loading processor and tokenizer...")
+
+    print("\n" + "="*50)
+    print("🔧 Stage 2/6: Loading processor and tokenizer...")
+    print("="*50)
+    print(f"   Loading processor for {model_args.backbone_name}")
+
     logger.info(f"Loading processor for {model_args.backbone_name}")
 
     # Try to load processor first, then feature extractor
@@ -349,14 +376,20 @@ def main():
             cache_dir=model_args.cache_dir
         )
 
-    # Load or create tokenizer
-    tokenizer_path = os.path.join("akan_mtl_tokenizer.model")
-    if os.path.exists(tokenizer_path):
-        logger.info(f"Loading existing tokenizer from {tokenizer_path}")
-        tokenizer = SentencePieceTokenizer(model_path=tokenizer_path)
+    # Load or create tokenizer - Fixed tokenizer loading
+    tokenizer_dir = os.path.join(training_args.output_dir, "tokenizer")
+
+    # Check for the actual model file, not just the directory
+    model_file = os.path.join(tokenizer_dir, "spm.model")
+
+    if os.path.exists(model_file):
+        logger.info(f"Loading existing tokenizer from {model_file}")
+        print(f"   Loading existing tokenizer from {model_file}")
+        tokenizer = SentencePieceTokenizer(model_path=model_file)
         tokenizer.load_tokenizer()
     else:
         logger.info("Creating new tokenizer")
+        print("   Creating new tokenizer")
         # Extract all text for tokenizer training
         all_texts = []
         for split in datasets_dict:
@@ -364,16 +397,18 @@ def main():
                 if 'words' in item:
                     all_texts.append(" ".join(item['words']))
 
+        # Create tokenizer directory if it doesn't exist
+        os.makedirs(tokenizer_dir, exist_ok=True)
+
         # Train tokenizer
-        os.makedirs(tokenizer_path, exist_ok=True)
-        text_file = os.path.join(tokenizer_path, "training_text.txt")
+        text_file = os.path.join(tokenizer_dir, "training_text.txt")
         with open(text_file, 'w') as f:
             for text in all_texts:
                 f.write(text + '\n')
 
         tokenizer = SentencePieceTokenizer(vocab_size=model_args.vocab_size)
         tokenizer.train_tokenizer(
-            text_file, model_prefix=os.path.join(tokenizer_path, "spm"))
+            text_file, model_prefix=os.path.join(tokenizer_dir, "spm"))
 
     # Parse emotion label map if provided
     emotion_label_map = None
@@ -381,20 +416,39 @@ def main():
         emotion_label_map = json.loads(data_args.emotion_label_map)
 
     # Create datasets
-    logger.info("Stage 3/6: Creating datasets...")
+    logger.info("Creating datasets...")
+    # Create datasets
+    print("\n" + "="*50)
+    print("📝 Stage 3/6: Creating datasets...")
+    print("="*50)
+
+    # Get backbone config for hidden size
+    temp_backbone = BackboneModel(
+        BACKBONE_CONFIGS[model_args.common_backbone_name])
+    feature_extractor = temp_backbone.feature_extractor
+    del temp_backbone
+
+    # Create model configuration
+    config = MTLConfig(
+        backbone_name=model_args.common_backbone_name,
+        vocab_size=tokenizer.get_vocab_size(),
+        emotion_classes=model_args.emotion_classes,
+        alpha_asr=model_args.alpha_asr,
+        alpha_prosody=model_args.alpha_prosody,
+        freeze_encoder=model_args.freeze_feature_extractor
+    )
+
     train_dataset = MTLDataset(
         datasets_dict['train'],
-        processor=processor,
-        target_sr=16000,
-        max_duration=data_args.max_duration_in_seconds,
+        config=config,
+        feature_extractor=feature_extractor,
         emotion_label_map=emotion_label_map
     )
 
     val_dataset = MTLDataset(
         datasets_dict['validation'],
-        processor=processor,
-        target_sr=16000,
-        max_duration=data_args.max_duration_in_seconds,
+        config=config,
+        feature_extractor=feature_extractor,
         emotion_label_map=emotion_label_map
     )
 
@@ -407,9 +461,11 @@ def main():
     )
 
     # Create model configuration
-    logger.info("Stage 4/6: Creating model configuration...")
+    print("\n" + "="*50)
+    print("⚙️ Stage 4/6: Creating model configuration...")
+    print("="*50)
     config = MTLConfig(
-        backbone_name=model_args.backbone_name,
+        backbone_name=model_args.common_backbone_name,
         vocab_size=tokenizer.get_vocab_size(),
         emotion_classes=model_args.emotion_classes,
         alpha_asr=model_args.alpha_asr,
@@ -418,9 +474,12 @@ def main():
     )
 
     # Create or load model
-    logger.info("Stage 5/6: Creating/loading model...")
+    print("\n" + "="*50)
+    print("🤖 Stage 5/6: Creating/loading model...")
+    print("="*50)
     if last_checkpoint is not None:
         logger.info(f"Loading model from checkpoint {last_checkpoint}")
+        print(f"   Loading model from checkpoint {last_checkpoint}")
         model = MTLModel.from_pretrained(last_checkpoint, config=config)
     else:
         logger.info("Creating new model")
@@ -429,17 +488,23 @@ def main():
         if model_args.freeze_feature_extractor:
             model.freeze_feature_extractor()
 
-    # Move model to GPU if available
-    model = model.to(device)
-
     # Log model info
     logger.info(
         f"Model created with {model.num_parameters(only_trainable=True):,} trainable parameters")
     logger.info(
         f"Total parameters: {model.num_parameters(only_trainable=False):,}")
 
+    print(f"\n📊 Model Statistics:")
+    trainable_params = model.num_parameters(only_trainable=True)
+    total_params = model.num_parameters(only_trainable=False)
+    print(f"   Trainable parameters: {trainable_params:,}")
+    print(f"   Total parameters: {total_params:,}")
+    print(f"   Model size: {total_params * 4 / (1024**2):.2f} MB")
+
     # Create trainer
-    logger.info("Stage 6/6: Setting up trainer...")
+    print("\n" + "="*50)
+    print("🎯 Stage 6/6: Setting up trainer...")
+    print("="*50)
     trainer = MTLTrainer(
         model=model,
         args=training_args,
@@ -453,7 +518,10 @@ def main():
 
     # Training
     if training_args.do_train:
-        logger.info("Starting training...")
+        print("\n" + "="*50)
+        print("🚂 Starting training...")
+        print("="*50)
+
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
             checkpoint = training_args.resume_from_checkpoint
@@ -469,25 +537,41 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
-        logger.info("Training completed!")
+        print("\n" + "="*50)
+        print("✅ Training completed!")
+        print("="*50)
+        print("\n📊 Training Metrics:")
+        for key, value in metrics.items():
+            print(f"   {key}: {value:.4f}")
 
     # Evaluation
     if training_args.do_eval:
-        logger.info("Starting evaluation...")
+        logger.info("*** Evaluate ***")
+        print("\n" + "="*50)
+        print("📊 Starting evaluation...")
+        print("="*50)
         metrics = trainer.evaluate()
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
-        logger.info("Evaluation completed!")
+
+        print("\n" + "="*50)
+        print("✅ Evaluation completed!")
+        print("="*50)
+        print("\n📊 Evaluation Metrics:")
+        for key, value in metrics.items():
+            print(f"   {key}: {value:.4f}")
 
     # Test evaluation
     if training_args.do_predict and data_args.test_json:
-        logger.info("Starting test evaluation...")
+        logger.info("*** Test ***")
+        print("\n" + "="*50)
+        print("🧪 Starting test evaluation...")
+        print("="*50)
         test_dataset = MTLDataset(
             datasets_dict['test'],
-            processor=processor,
-            target_sr=16000,
-            max_duration=data_args.max_duration_in_seconds,
+            config=config,
+            feature_extractor=feature_extractor,
             emotion_label_map=emotion_label_map
         )
 
@@ -496,7 +580,17 @@ def main():
 
         trainer.log_metrics("test", metrics)
         trainer.save_metrics("test", metrics)
-        logger.info("Test evaluation completed!")
+
+        print("\n" + "="*50)
+        print("✅ Test evaluation completed!")
+        print("="*50)
+        print("\n📊 Test Metrics:")
+        for key, value in metrics.items():
+            print(f"   {key}: {value:.4f}")
+
+    print("\n" + "="*50)
+    print("🎉 Pipeline completed successfully!")
+    print("="*50 + "\n")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple, Union
-from transformers import PreTrainedModel, AutoModel
+from transformers import PreTrainedModel, AutoModel, WhisperModel
 from transformers.modeling_outputs import BaseModelOutput
 from dataclasses import dataclass
 
@@ -28,8 +28,13 @@ class MTLModel(PreTrainedModel):
     Performs SER (main task) + ASR + Prosody (auxiliary tasks)
     """
 
+    config_class = MTLConfig
+
     def __init__(self, config: MTLConfig):
+        # Initialize the base Module class first
         super().__init__(config)
+
+        # Store config
         self.config = config
 
         # Load backbone using AutoModel
@@ -63,10 +68,10 @@ class MTLModel(PreTrainedModel):
         self.alpha_asr = config.alpha_asr
         self.alpha_prosody = config.alpha_prosody
 
-        # Get device
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu")
-        print(f"MTLModel initialized on device: {self.device}")
+        # Move model to appropriate device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(device)
+        print(f"MTLModel initialized on device: {device}")
 
     def _get_hidden_size(self) -> int:
         """Get hidden size from backbone model"""
@@ -92,8 +97,8 @@ class MTLModel(PreTrainedModel):
         # Move tensors to the same device as the model
         logits = logits.to(self.device)
         labels = labels.to(self.device)
-        input_lengths = input_lengths.to(self.device)
-        label_lengths = label_lengths.to(self.device)
+        input_lengths = input_lengths.to(self.device).to(dtype=torch.long)
+        label_lengths = label_lengths.to(self.device).to(dtype=torch.long)
 
         # Get log probabilities
         log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
@@ -108,13 +113,16 @@ class MTLModel(PreTrainedModel):
                 labels_flat, dtype=torch.long, device=self.device)
 
         # Compute CTC loss
+        blank_token = getattr(self.config, 'pad_token_id', None)
+        if blank_token is None:
+            blank_token = 0
+
         loss = F.ctc_loss(
             log_probs,
             labels,
             input_lengths,
             label_lengths,
-            blank=self.config.pad_token_id if hasattr(
-                self.config, 'pad_token_id') else 0,
+            blank=blank_token,
             reduction='mean',
             zero_infinity=True
         )
@@ -153,7 +161,6 @@ class MTLModel(PreTrainedModel):
         input_values: Optional[torch.Tensor] = None,
         input_features: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        # (asr_labels, ser_labels, prosody_labels)
         labels: Optional[Tuple[torch.Tensor, ...]] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -161,18 +168,6 @@ class MTLModel(PreTrainedModel):
     ) -> Union[Tuple, MTLOutput]:
         """
         Forward pass through the model.
-
-        Args:
-            input_values: Raw audio input (for wav2vec2-like models)
-            input_features: Preprocessed features (for whisper-like models)
-            attention_mask: Attention mask
-            labels: Tuple of (asr_labels, ser_labels, prosody_labels)
-            output_attentions: Whether to output attention weights
-            output_hidden_states: Whether to output hidden states
-            return_dict: Whether to return a dictionary
-
-        Returns:
-            MTLOutput or tuple of outputs
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -188,16 +183,34 @@ class MTLModel(PreTrainedModel):
         if attention_mask is not None:
             inputs["attention_mask"] = attention_mask.to(self.device)
 
-        # Get backbone outputs
-        outputs = self.backbone(
-            **inputs,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
+        # Handle different model architectures
+        if self.config.backbone_name == "whisper":
+            # For Whisper, use only the encoder
+            if hasattr(self.backbone, 'encoder'):
+                encoder = self.backbone.encoder
+            elif hasattr(self.backbone, 'model') and hasattr(self.backbone.model, 'encoder'):
+                encoder = self.backbone.model.encoder
+            else:
+                raise ValueError("Cannot find encoder in Whisper model")
 
-        # Extract hidden states
-        hidden_states = outputs[0] if not return_dict else outputs.last_hidden_state
+            encoder_outputs = encoder(
+                **inputs,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+            )
+            hidden_states = encoder_outputs.last_hidden_state
+        else:
+            # For other models (wav2vec2, etc.)
+            outputs = self.backbone(
+                **inputs,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+            )
+            hidden_states = outputs.last_hidden_state
+
+        # Apply dropout
         hidden_states = self.dropout(hidden_states)
 
         # Task-specific predictions
@@ -216,48 +229,71 @@ class MTLModel(PreTrainedModel):
         loss_details = {}
 
         if labels is not None:
-            asr_labels, ser_labels, prosody_labels = labels
+            # Unpack labels - expecting ((asr_labels, asr_lengths), ser_labels, prosody_labels)
+            asr_labels_info, ser_labels, prosody_labels = labels
 
             # SER loss (main task, weight = 1.0)
             if ser_labels is not None:
-                ser_loss = self._compute_ser_loss(ser_logits, ser_labels)
+                ser_loss = self._compute_ser_loss(
+                    ser_logits, ser_labels.to(self.device))
                 loss = ser_loss
                 loss_details['ser_loss'] = ser_loss.item()
 
             # ASR loss (auxiliary task, weighted by alpha)
-            if asr_labels is not None and self.alpha_asr > 0:
+            if asr_labels_info is not None and self.alpha_asr > 0:
                 # Compute input lengths from attention mask or assume full length
-                if attention_mask is not None:
-                    input_lengths = attention_mask.sum(-1)
-                else:
-                    input_lengths = torch.full(
-                        (asr_logits.size(0),), asr_logits.size(1),
-                        dtype=torch.long, device=self.device
-                    )
-
-                # Assume label lengths are provided or compute from labels
-                if isinstance(asr_labels, tuple):
-                    asr_labels_tensor, label_lengths = asr_labels
-                else:
-                    # Compute lengths from padding (assuming -100 is padding)
-                    asr_labels_tensor = asr_labels
-                    label_lengths = (asr_labels_tensor != -100).sum(-1)
-
-                asr_loss = self._compute_ctc_loss(
-                    asr_logits, asr_labels_tensor, input_lengths, label_lengths
+                input_lengths = torch.full(
+                    (asr_logits.size(0),), asr_logits.size(1),
+                    dtype=torch.long, device=self.device
                 )
 
-                if loss is None:
-                    loss = self.alpha_asr * asr_loss
-                else:
-                    loss = loss + self.alpha_asr * asr_loss
+                # asr_labels_info should be either:
+                # 1. A tuple/list of (labels, lengths)
+                # 2. Just labels tensor
+                if isinstance(asr_labels_info, (tuple, list)) and len(asr_labels_info) == 2:
+                    asr_labels_tensor, label_lengths = asr_labels_info
 
-                loss_details['asr_loss'] = asr_loss.item()
-                loss_details['asr_loss_weighted'] = (
-                    self.alpha_asr * asr_loss).item()
+                    # Move to device if needed
+                    if isinstance(asr_labels_tensor, torch.Tensor):
+                        asr_labels_tensor = asr_labels_tensor.to(self.device)
+                    else:
+                        asr_labels_tensor = torch.tensor(
+                            asr_labels_tensor, dtype=torch.long, device=self.device)
+
+                    if isinstance(label_lengths, torch.Tensor):
+                        label_lengths = label_lengths.to(self.device)
+                    else:
+                        label_lengths = torch.tensor(
+                            label_lengths, dtype=torch.long, device=self.device)
+
+                elif isinstance(asr_labels_info, torch.Tensor):
+                    # It's just a tensor of labels
+                    asr_labels_tensor = asr_labels_info.to(self.device)
+                    # Compute lengths from padding (assuming -100 is padding)
+                    label_lengths = (asr_labels_tensor != -100).sum(-1)
+                else:
+                    # Handle None case
+                    asr_labels_tensor = None
+                    label_lengths = None
+
+                if asr_labels_tensor is not None:
+                    asr_loss = self._compute_ctc_loss(
+                        asr_logits, asr_labels_tensor, input_lengths, label_lengths
+                    )
+
+                    if loss is None:
+                        loss = self.alpha_asr * asr_loss
+                    else:
+                        loss = loss + self.alpha_asr * asr_loss
+
+                    loss_details['asr_loss'] = asr_loss.item()
+                    loss_details['asr_loss_weighted'] = (
+                        self.alpha_asr * asr_loss).item()
 
             # Prosody loss (auxiliary task, weighted by alpha)
             if prosody_labels is not None and self.alpha_prosody > 0:
+                prosody_labels = prosody_labels.to(self.device)
+
                 # Ensure prosody labels match sequence length
                 if prosody_labels.size(1) != prosody_logits.size(1):
                     # Simple interpolation to match sizes
@@ -283,7 +319,7 @@ class MTLModel(PreTrainedModel):
                 loss_details['total_loss'] = loss.item()
 
         if not return_dict:
-            output = (ser_logits, asr_logits, prosody_logits) + outputs[1:]
+            output = (ser_logits, asr_logits, prosody_logits)
             return ((loss,) + output) if loss is not None else output
 
         return MTLOutput(
@@ -291,8 +327,8 @@ class MTLModel(PreTrainedModel):
             ser_logits=ser_logits,
             asr_logits=asr_logits,
             prosody_logits=prosody_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            hidden_states=hidden_states if output_hidden_states else None,
+            attentions=None,
             loss_details=loss_details,
         )
 
@@ -300,7 +336,7 @@ class MTLModel(PreTrainedModel):
         """Get the hidden size of the backbone model"""
         return self.hidden_size
 
-    def num_parameters(self, only_trainable: bool = True) -> int:
+    def num_parameters(self, only_trainable: bool = True, exclude_embeddings: bool = False) -> int:
         """Get number of parameters"""
         if only_trainable:
             return sum(p.numel() for p in self.parameters() if p.requires_grad)
