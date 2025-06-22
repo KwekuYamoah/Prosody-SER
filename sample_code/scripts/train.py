@@ -1,597 +1,518 @@
-#!/usr/bin/env python3
 """
-Improved training script for MTL model following the paper's approach.
-Cleaner, more efficient, and easier to debug.
+Paper-Style Training Script for MTL Model
+Following "Speech Emotion Recognition with Multi-task Learning" methodology
 """
 
-import os
-import sys
-import logging
-import json
-from dataclasses import dataclass, field
-from typing import Optional, Dict, List
-import numpy as np
 import torch
-from torch import nn
-from transformers import (
-    HfArgumentParser,
-    Trainer,
-    TrainingArguments,
-    AutoProcessor,
-    AutoFeatureExtractor,
-    AutoTokenizer,
-    set_seed,
-    EvalPrediction
-)
-from transformers.trainer_utils import get_last_checkpoint
-import datasets
-from sklearn.metrics import accuracy_score, f1_score
+import os
+import argparse
+import json
 import wandb
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
-from sample_code.scripts.backbone_models import BACKBONE_CONFIGS, BackboneModel
-from sample_code.scripts.mtl_model import MTLModel, MTLOutput
-from sample_code.scripts.mtl_dataset import MTLDataset, DataCollatorMTLWithPadding
+# Import core modules
 from sample_code.scripts.mtl_config import MTLConfig
+from sample_code.scripts.mtl_model import MTLModel
+from sample_code.scripts.mtl_dataset import MTLDataset
+from sample_code.scripts.backbone_models import BACKBONE_CONFIGS, BackboneModel
 from sample_code.scripts.tokenizer import SentencePieceTokenizer
 
-# For ASR metrics
-try:
-    from jiwer import wer, cer
-except ImportError:
-    print("jiwer not installed. ASR metrics will not be available.")
-    wer = cer = None
+# Import training components
+from sample_code.training.trainer import MTLTrainer
+from sample_code.training.evaluator import MTLEvaluator
+from sample_code.training.utils import collate_fn_mtl, configure_cuda_memory, NumpyEncoder
 
-logger = logging.getLogger(__name__)
+# Import utilities
+from sample_code.scripts.memory_utils import print_memory_usage, cleanup_memory
+from sample_code.utils import load_and_prepare_datasets, setup_tokenizer_and_dataset
+
+# Set environment variables for better memory management
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Avoid deadlocks with DataLoader
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+torch.serialization.add_safe_globals([MTLConfig])
 
 
-@dataclass
-class ModelArguments:
-    """Arguments for model configuration"""
-    backbone_name: str = field(
-        default="facebook/wav2vec2-base",
-        metadata={"help": "Pretrained model name or path"}
+def parse_arguments():
+    """Parse command line arguments following paper's experimental setup"""
+    parser = argparse.ArgumentParser(
+        description="Paper-Style MTL Training for Speech Emotion Recognition")
+
+    # Model configuration
+    parser.add_argument("--backbone", type=str, default="whisper",
+                        choices=list(BACKBONE_CONFIGS.keys()),
+                        help="Backbone model (paper used wav2vec-2.0)")
+    parser.add_argument("--vocab_size", type=int, default=4000,
+                        help="Vocabulary size for tokenizer")
+
+    # Paper-style alpha configuration
+    parser.add_argument("--alpha_asr", type=float, default=0.1,
+                        help="Alpha weight for ASR auxiliary task (paper optimal: 0.1)")
+    parser.add_argument("--alpha_prosody", type=float, default=0.1,
+                        help="Alpha weight for Prosody auxiliary task (paper optimal: 0.1)")
+
+    # Enhanced CTC regularization parameters (NEW)
+    parser.add_argument("--ctc_entropy_weight", type=float, default=0.01,
+                        help="Entropy regularization weight for CTC loss")
+    parser.add_argument("--ctc_blank_penalty", type=float, default=0.1,
+                        help="Blank penalty weight for CTC loss")
+    parser.add_argument("--ctc_blank_threshold", type=float, default=0.3,
+                        help="Threshold for blank penalty (default: 0.3, much better than 0.8)")
+    parser.add_argument("--ctc_label_smoothing", type=float, default=0.0,
+                        help="Label smoothing for CTC loss")
+    parser.add_argument("--ctc_confidence_penalty", type=float, default=0.0,
+                        help="Confidence penalty for CTC loss")
+
+    # Alpha experimentation
+    parser.add_argument("--run_ablation_study", action="store_true",
+                        help="Run paper's ablation study with different alpha values")
+    parser.add_argument("--ablation_alphas", nargs='+', type=float,
+                        default=[0.0, 0.001, 0.01, 0.1, 1.0],
+                        help="Alpha values to test in ablation study")
+    parser.add_argument("--ablation_epochs", type=int, default=5,
+                        help="Epochs per alpha in ablation study")
+
+    # Data configuration
+    parser.add_argument("--audio_base_path", type=str, required=True,
+                        help="Base path to audio files directory")
+    parser.add_argument("--train_jsonl", type=str, required=True,
+                        help="Path to training JSONL file")
+    parser.add_argument("--val_jsonl", type=str, required=True,
+                        help="Path to validation JSONL file")
+    parser.add_argument("--test_jsonl", type=str, required=True,
+                        help="Path to test JSONL file")
+
+    # Training configuration
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="Batch size per GPU")
+    parser.add_argument("--num_epochs", type=int, default=100,
+                        help="Number of training epochs")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4,
+                        help="Gradient accumulation steps")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing for memory efficiency")
+
+    # Paper-style learning rates
+    parser.add_argument("--backbone_lr", type=float, default=1e-5,
+                        help="Learning rate for backbone (fine-tuning)")
+    parser.add_argument("--head_lr", type=float, default=5e-5,
+                        help="Learning rate for task heads")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1,
+                        help="Warmup ratio for learning rate schedule")
+
+    # Training options
+    parser.add_argument("--save_dir", type=str, default="paper_style_checkpoints",
+                        help="Directory to save checkpoints")
+    parser.add_argument("--early_stopping_patience", type=int, default=10,
+                        help="Patience for early stopping")
+    parser.add_argument("--checkpoint_interval", type=int, default=5,
+                        help="Save checkpoint every N epochs")
+    parser.add_argument("--eval_steps", type=int, default=500,
+                        help="Evaluate every N training steps")
+    parser.add_argument("--log_steps", type=int, default=100,
+                        help="Log every N training steps")
+
+    # Experiment tracking
+    parser.add_argument("--use_wandb", action="store_true",
+                        help="Use Weights & Biases for experiment tracking")
+    parser.add_argument("--wandb_project", type=str, default="paper-mtl-speech",
+                        help="W&B project name")
+    parser.add_argument("--experiment_name", type=str, default=None,
+                        help="Experiment name for tracking")
+
+    # Performance options
+    parser.add_argument("--use_amp", action="store_true", default=True,
+                        help="Use automatic mixed precision")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="Number of data loading workers")
+    parser.add_argument("--pin_memory", action="store_true", default=True,
+                        help="Pin memory for faster GPU transfer")
+    parser.add_argument("--prefetch_factor", type=int, default=2,
+                        help="Number of batches to prefetch per worker")
+
+    # Tokenizer options
+    parser.add_argument("--tokenizer_path", type=str,
+                        help="Path to trained tokenizer")
+    parser.add_argument("--retrain_tokenizer", action="store_true",
+                        help="Whether to retrain the tokenizer")
+
+    return parser.parse_args()
+
+
+def setup_paper_style_config(args, tokenizer):
+    """Setup configuration following paper's methodology with enhanced CTC"""
+    config = MTLConfig.create_paper_config(
+        backbone_name=args.backbone,
+        alpha_asr=args.alpha_asr,
+        alpha_prosody=args.alpha_prosody
     )
-    common_backbone_name: str = field(
-        default="whisper",
-        metadata={"help": "Common model name"}
-    )
-    vocab_size: int = field(
-        default=4000,
-        metadata={"help": "Vocabulary size for ASR"}
-    )
-    emotion_classes: int = field(
-        default=9,
-        metadata={"help": "Number of emotion classes"}
-    )
-    alpha_asr: float = field(
-        default=0.1,
-        metadata={"help": "Weight for ASR auxiliary task"}
-    )
-    alpha_prosody: float = field(
-        default=0.1,
-        metadata={"help": "Weight for Prosody auxiliary task"}
-    )
-    freeze_feature_extractor: bool = field(
-        default=False,
-        metadata={"help": "Whether to freeze feature extractor"}
-    )
-    cache_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Cache directory for pretrained models"}
-    )
+
+    # Update with tokenizer and task settings
+    config.vocab_size = tokenizer.get_vocab_size()
+    config.emotion_classes = 9
+    config.prosody_classes = 2
+
+    # Enhanced CTC regularization settings
+    config.ctc_entropy_weight = args.ctc_entropy_weight
+    config.ctc_blank_penalty = args.ctc_blank_penalty
+    config.ctc_blank_threshold = args.ctc_blank_threshold
+    config.ctc_label_smoothing = args.ctc_label_smoothing
+    config.ctc_confidence_penalty = args.ctc_confidence_penalty
+
+    # Learning rate settings
+    config.backbone_learning_rate = args.backbone_lr
+    config.task_head_learning_rate = args.head_lr
+
+    return config
 
 
-@dataclass
-class DataArguments:
-    """Arguments for data configuration"""
-    train_json: str = field(
-        metadata={"help": "Path to training JSONL file"}
-    )
-    val_json: str = field(
-        metadata={"help": "Path to validation JSONL file"}
-    )
-    test_json: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to test JSONL file"}
-    )
-    audio_base_path: str = field(
-        default="",
-        metadata={
-            "help": "Base path for audio files (not needed if using preprocessed data)"}
-    )
-    max_duration_in_seconds: Optional[float] = field(
-        default=300.0,
-        metadata={"help": "Maximum audio duration"}
-    )
-    preprocessing_num_workers: int = field(
-        default=4,
-        metadata={"help": "Number of workers for preprocessing"}
-    )
-    emotion_label_map: Optional[str] = field(
-        default=None,
-        metadata={"help": "JSON string mapping emotion names to indices"}
+def create_efficient_data_loaders(dataset_dict, config, tokenizer, feature_extractor, args):
+    """Create memory-efficient data loaders with proper settings"""
+    train_dataset = MTLDataset(
+        dataset_dict['train'], config=config, feature_extractor=feature_extractor)
+    val_dataset = MTLDataset(
+        dataset_dict['val'], config=config, feature_extractor=feature_extractor)
+
+    # DataLoader with optimized settings
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=lambda batch: collate_fn_mtl(
+            batch, pad_token_id=tokenizer.pad_id, tokenizer=tokenizer,
+            backbone_name=config.backbone_name
+        ),
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory and torch.cuda.is_available(),
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        persistent_workers=args.num_workers > 0,  # Keep workers alive between epochs
+        drop_last=True  # Drop incomplete batches for stable training
     )
 
+    val_loader = DataLoader(
+        val_dataset,
+        # Larger batch for validation (no gradients)
+        batch_size=args.batch_size * 2,
+        shuffle=False,
+        collate_fn=lambda batch: collate_fn_mtl(
+            batch, pad_token_id=tokenizer.pad_id, tokenizer=tokenizer,
+            backbone_name=config.backbone_name
+        ),
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory and torch.cuda.is_available(),
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        persistent_workers=args.num_workers > 0
+    )
 
-class MTLTrainer(Trainer):
-    """Custom trainer for multi-task learning"""
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Compute multi-task loss"""
-        outputs = model(**inputs)
-        loss = outputs.loss if isinstance(outputs, MTLOutput) else outputs[0]
-        return (loss, outputs) if return_outputs else loss
-
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        """Custom prediction step to handle multiple outputs"""
-        with torch.no_grad():
-            with self.autocast_smart_context_manager():
-                outputs = model(**inputs)
-                loss = outputs.loss if isinstance(
-                    outputs, MTLOutput) else outputs[0]
-
-                if isinstance(outputs, MTLOutput):
-                    # Extract logits for each task
-                    ser_logits = outputs.ser_logits
-                    asr_logits = outputs.asr_logits
-                    prosody_logits = outputs.prosody_logits
-                    logits = (ser_logits, asr_logits, prosody_logits)
-                else:
-                    # Assuming (loss, ser, asr, prosody, ...)
-                    logits = outputs[1:4]
-
-        if prediction_loss_only:
-            return (loss, None, None)
-
-        # Return predictions and labels
-        labels = inputs.get("labels", None)
-        return (loss, logits, labels)
+    return train_loader, val_loader
 
 
-def compute_metrics(eval_pred: EvalPrediction, tokenizer=None) -> Dict[str, float]:
-    """Compute metrics for all tasks"""
-    predictions = eval_pred.predictions
-    labels = eval_pred.label_ids
-
-    metrics = {}
-
-    # Unpack predictions and labels
-    if len(predictions) == 3:
-        ser_preds, asr_preds, prosody_preds = predictions
-    else:
-        logger.warning(
-            f"Unexpected prediction format: {len(predictions)} elements")
-        return metrics
-
-    if isinstance(labels, tuple) and len(labels) == 3:
-        asr_labels_info, ser_labels, prosody_labels = labels
-        if isinstance(asr_labels_info, tuple):
-            asr_labels, asr_lengths = asr_labels_info
-        else:
-            asr_labels = asr_labels_info
-            asr_lengths = None
-    else:
-        logger.warning(f"Unexpected label format")
-        return metrics
-
-    # 1. SER metrics (emotion classification)
-    if ser_preds is not None and ser_labels is not None:
-        ser_predictions = np.argmax(ser_preds, axis=-1)
-        ser_accuracy = accuracy_score(ser_labels, ser_predictions)
-        ser_f1 = f1_score(ser_labels, ser_predictions, average='weighted')
-
-        metrics['ser_accuracy'] = ser_accuracy
-        metrics['ser_f1'] = ser_f1
-
-    # 2. ASR metrics (if tokenizer provided and jiwer available)
-    if asr_preds is not None and asr_labels is not None and tokenizer is not None and wer is not None:
-        # Decode predictions
-        asr_predictions = np.argmax(asr_preds, axis=-1)
-
-        # Simple greedy decoding (you might want to use CTC decoder)
-        pred_texts = []
-        ref_texts = []
-
-        for i in range(len(asr_predictions)):
-            # Decode prediction
-            pred_ids = asr_predictions[i]
-            # Remove repetitions and blank tokens
-            decoded_ids = []
-            prev_id = -1
-            for id in pred_ids:
-                if id != 0 and id != prev_id:  # 0 is blank token
-                    decoded_ids.append(id)
-                prev_id = id
-
-            pred_text = tokenizer.decode(decoded_ids, skip_special_tokens=True)
-            pred_texts.append(pred_text)
-
-            # Decode reference
-            if asr_lengths is not None:
-                ref_ids = asr_labels[i][:asr_lengths[i]] if i < len(
-                    asr_lengths) else asr_labels[i]
-            else:
-                ref_ids = asr_labels[i]
-            ref_ids = ref_ids[ref_ids != -100]  # Remove padding
-            ref_text = tokenizer.decode(
-                ref_ids.tolist(), skip_special_tokens=True)
-            ref_texts.append(ref_text)
-
-        # Compute WER and CER
-        word_error_rate = wer(ref_texts, pred_texts)
-        char_error_rate = cer(ref_texts, pred_texts)
-
-        metrics['asr_wer'] = word_error_rate
-        metrics['asr_cer'] = char_error_rate
-
-    # 3. Prosody metrics (binary sequence classification)
-    if prosody_preds is not None and prosody_labels is not None:
-        # Flatten predictions and labels
-        prosody_predictions = (prosody_preds > 0).astype(float).flatten()
-        prosody_labels_flat = prosody_labels.flatten()
-
-        # Remove padding (assuming -100 or negative values are padding)
-        mask = prosody_labels_flat >= 0
-        if mask.sum() > 0:
-            prosody_predictions_masked = prosody_predictions[mask]
-            prosody_labels_masked = prosody_labels_flat[mask]
-
-            prosody_accuracy = accuracy_score(
-                prosody_labels_masked, prosody_predictions_masked)
-            prosody_f1 = f1_score(prosody_labels_masked,
-                                  prosody_predictions_masked, average='binary')
-
-            metrics['prosody_accuracy'] = prosody_accuracy
-            metrics['prosody_f1'] = prosody_f1
-
-    return metrics
-
-
-def load_preprocessed_datasets(data_args: DataArguments) -> Dict[str, List[Dict]]:
-    """Load datasets from preprocessed JSONL files"""
-    import json
-
-    datasets_dict = {}
-
-    # Load training data
-    print(f"Loading preprocessed training data from {data_args.train_json}")
-    with open(data_args.train_json, 'r') as f:
-        train_data = []
-        for line in f:
-            item = json.loads(line)
-            # Convert audio_data from list back to numpy array if needed
-            if 'audio_data' in item and isinstance(item['audio_data'], list):
-                item['audio_data'] = np.array(
-                    item['audio_data'], dtype=np.float32)
-            train_data.append(item)
-    datasets_dict['train'] = train_data
-
-    # Load validation data
-    print(f"Loading preprocessed validation data from {data_args.val_json}")
-    with open(data_args.val_json, 'r') as f:
-        val_data = []
-        for line in f:
-            item = json.loads(line)
-            if 'audio_data' in item and isinstance(item['audio_data'], list):
-                item['audio_data'] = np.array(
-                    item['audio_data'], dtype=np.float32)
-            val_data.append(item)
-    datasets_dict['validation'] = val_data
-
-    # Load test data if provided
-    if data_args.test_json:
-        print(f"Loading preprocessed test data from {data_args.test_json}")
-        with open(data_args.test_json, 'r') as f:
-            test_data = []
-            for line in f:
-                item = json.loads(line)
-                if 'audio_data' in item and isinstance(item['audio_data'], list):
-                    item['audio_data'] = np.array(
-                        item['audio_data'], dtype=np.float32)
-                test_data.append(item)
-        datasets_dict['test'] = test_data
-
-    return datasets_dict
+def log_ctc_statistics(trainer, epoch):
+    """Log CTC blank statistics for monitoring"""
+    if hasattr(trainer.model, 'asr_loss') and hasattr(trainer.model.asr_loss, 'get_blank_statistics'):
+        # This would need to be called during forward pass
+        # For now, we'll log during training
+        pass
 
 
 def main():
-    # Parse arguments
-    parser = HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments))
+    """Main training function following paper's methodology with enhancements"""
+    args = parse_arguments()
 
-    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # Load from json file
-        model_args, data_args, training_args = parser.parse_json_file(
-            json_file=os.path.abspath(sys.argv[1]))
-    else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    # Print configuration
+    print("\n" + "="*60)
+    print("PAPER-STYLE MTL TRAINING WITH ENHANCED CTC")
+    print("="*60)
+    print("Following: 'Speech Emotion Recognition with Multi-task Learning'")
+    print(f"Main task: SER (weight = 1.0)")
+    print(
+        f"Auxiliary tasks: ASR (α = {args.alpha_asr}), Prosody (α = {args.alpha_prosody})")
+    print(f"Loss formula: L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody")
+    print(f"Backbone: {args.backbone}")
+    print(f"Learning rates: Backbone={args.backbone_lr}, Heads={args.head_lr}")
+    print(f"\nEnhanced CTC Regularization:")
+    print(f"  Entropy weight: {args.ctc_entropy_weight}")
+    print(f"  Blank penalty: {args.ctc_blank_penalty}")
+    print(
+        f"  Blank threshold: {args.ctc_blank_threshold} (much better than 0.8!)")
+    print(f"  Label smoothing: {args.ctc_label_smoothing}")
+    print(f"  Confidence penalty: {args.ctc_confidence_penalty}")
 
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-    log_level = training_args.get_process_log_level()
-    logger.setLevel(log_level)
-    datasets.utils.logging.set_verbosity(log_level)
+    # Setup device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\nUsing device: {device}")
 
-    # Log arguments
-    logger.info(f"Training/evaluation parameters {training_args}")
-    logger.info(f"Model parameters {model_args}")
-    logger.info(f"Data parameters {data_args}")
+    if torch.cuda.is_available():
+        configure_cuda_memory()
+        torch.backends.cudnn.benchmark = True
+        # Enable TF32 for A100 GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
-    # Detect checkpoint
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
-            )
-        elif last_checkpoint is not None:
-            logger.info(
-                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
-                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
-            )
+    print_memory_usage("Initial memory usage:")
 
-    # Set seed
-    set_seed(training_args.seed)
-    print(f"\n🎲 Set random seed to {training_args.seed}")
+    # Initialize wandb if enabled
+    if args.use_wandb:
+        experiment_name = args.experiment_name or f"paper_mtl_alpha_{args.alpha_asr}_{args.alpha_prosody}_ctc_enhanced"
+        wandb.init(
+            project=args.wandb_project,
+            name=experiment_name,
+            config=vars(args),
+            tags=["paper-style", "enhanced-ctc", f"alpha-{args.alpha_asr}"]
+        )
 
     # Load datasets
-    logger.info("Loading preprocessed datasets...")
+    print("\n" + "="*60)
+    print("DATA LOADING")
+    print("="*60)
 
-    print("\n" + "="*50)
-    print("📊 Stage 1/6: Loading datasets...")
-    print("="*50)
+    dataset_dict = load_and_prepare_datasets(
+        args.train_jsonl, args.val_jsonl, args.test_jsonl, args.audio_base_path
+    )
 
-    datasets_dict = load_preprocessed_datasets(data_args)
-    logger.info(f"Loaded {len(datasets_dict['train'])} training samples")
-    logger.info(
-        f"Loaded {len(datasets_dict['validation'])} validation samples")
+    print(f"Dataset sizes:")
+    print(f"  Train: {len(dataset_dict['train'])} samples")
+    print(f"  Val: {len(dataset_dict['val'])} samples")
+    print(f"  Test: {len(dataset_dict['test'])} samples")
 
-    print(f"   ✓ Loaded {len(datasets_dict['train'])} training samples")
-    print(f"   ✓ Loaded {len(datasets_dict['validation'])} validation samples")
-
-    # Load processor and tokenizer based on model type
-
-    print("\n" + "="*50)
-    print("🔧 Stage 2/6: Loading processor and tokenizer...")
-    print("="*50)
-    print(f"   Loading processor for {model_args.backbone_name}")
-
-    logger.info(f"Loading processor for {model_args.backbone_name}")
-
-    # Try to load processor first, then feature extractor
-    try:
-        processor = AutoProcessor.from_pretrained(
-            model_args.backbone_name,
-            cache_dir=model_args.cache_dir
-        )
-    except:
-        processor = AutoFeatureExtractor.from_pretrained(
-            model_args.backbone_name,
-            cache_dir=model_args.cache_dir
-        )
-
-    # Load or create tokenizer - Fixed tokenizer loading
-    tokenizer_dir = os.path.join(training_args.output_dir, "tokenizer")
-
-    # Check for the actual model file, not just the directory
-    model_file = os.path.join(tokenizer_dir, "spm.model")
-
-    if os.path.exists(model_file):
-        logger.info(f"Loading existing tokenizer from {model_file}")
-        print(f"   Loading existing tokenizer from {model_file}")
-        tokenizer = SentencePieceTokenizer(model_path=model_file)
-        tokenizer.load_tokenizer()
+    # Setup tokenizer
+    if args.retrain_tokenizer or args.tokenizer_path is None:
+        print("\nTraining new SentencePiece tokenizer...")
+        tokenizer = setup_tokenizer_and_dataset(
+            dataset_dict, vocab_size=args.vocab_size)
+        tokenizer_save_path = os.path.join(args.save_dir, "tokenizer.model")
+        os.makedirs(args.save_dir, exist_ok=True)
+        # Save tokenizer for future use
+        import shutil
+        shutil.copy(tokenizer.model_path, tokenizer_save_path)
+        print(f"Tokenizer saved to: {tokenizer_save_path}")
     else:
-        logger.info("Creating new tokenizer")
-        print("   Creating new tokenizer")
-        # Extract all text for tokenizer training
-        all_texts = []
-        for split in datasets_dict:
-            for item in datasets_dict[split]:
-                if 'words' in item:
-                    all_texts.append(" ".join(item['words']))
+        print(f"\nLoading existing tokenizer from {args.tokenizer_path}")
+        tokenizer = SentencePieceTokenizer(model_path=args.tokenizer_path)
+        tokenizer.load_tokenizer()
 
-        # Create tokenizer directory if it doesn't exist
-        os.makedirs(tokenizer_dir, exist_ok=True)
+    print(f"Tokenizer vocabulary size: {tokenizer.get_vocab_size()}")
+    print(f"Tokenizer blank ID: {tokenizer.blank_id}")
 
-        # Train tokenizer
-        text_file = os.path.join(tokenizer_dir, "training_text.txt")
-        with open(text_file, 'w') as f:
-            for text in all_texts:
-                f.write(text + '\n')
+    # Setup configuration and model
+    print("\n" + "="*60)
+    print("MODEL SETUP")
+    print("="*60)
 
-        tokenizer = SentencePieceTokenizer(vocab_size=model_args.vocab_size)
-        tokenizer.train_tokenizer(
-            text_file, model_prefix=os.path.join(tokenizer_dir, "spm"))
+    config = setup_paper_style_config(args, tokenizer)
+    print("\nConfiguration summary:")
+    summary = config.get_paper_summary()
+    print(json.dumps(summary, indent=2))
 
-    # Parse emotion label map if provided
-    emotion_label_map = None
-    if data_args.emotion_label_map:
-        emotion_label_map = json.loads(data_args.emotion_label_map)
+    # Create paper-style model with enhanced CTC
+    model = MTLModel(
+        config=config,
+        use_asr=True,
+        use_prosody=True,
+        use_ser=True,
+        tokenizer=tokenizer
+    ).to(device)
 
-    # Create datasets
-    logger.info("Creating datasets...")
-    # Create datasets
-    print("\n" + "="*50)
-    print("📝 Stage 3/6: Creating datasets...")
-    print("="*50)
+    # Enable gradient checkpointing if requested
+    if args.gradient_checkpointing and hasattr(model.backbone, 'gradient_checkpointing_enable'):
+        model.backbone.gradient_checkpointing_enable()
+        print("✓ Gradient checkpointing enabled for memory efficiency")
 
-    # Get backbone config for hidden size
-    temp_backbone = BackboneModel(
-        BACKBONE_CONFIGS[model_args.common_backbone_name])
+    print(f"\nModel info:")
+    print(f"  Active heads: {model.get_active_heads()}")
+    print(
+        f"  Training approach: {model.get_paper_training_info()['model_type']}")
+    print(
+        f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(
+        f"  Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+    # Create feature extractor
+    temp_backbone = BackboneModel(config.backbone_config)
     feature_extractor = temp_backbone.feature_extractor
     del temp_backbone
+    cleanup_memory()
 
-    # Create model configuration
-    config = MTLConfig(
-        backbone_name=model_args.common_backbone_name,
-        vocab_size=tokenizer.get_vocab_size(),
-        emotion_classes=model_args.emotion_classes,
-        alpha_asr=model_args.alpha_asr,
-        alpha_prosody=model_args.alpha_prosody,
-        freeze_encoder=model_args.freeze_feature_extractor
+    # Create efficient data loaders
+    train_loader, val_loader = create_efficient_data_loaders(
+        dataset_dict, config, tokenizer, feature_extractor, args
     )
 
-    train_dataset = MTLDataset(
-        datasets_dict['train'],
-        config=config,
-        feature_extractor=feature_extractor,
-        emotion_label_map=emotion_label_map
-    )
+    print_memory_usage("After data loader creation:")
 
-    val_dataset = MTLDataset(
-        datasets_dict['validation'],
-        config=config,
-        feature_extractor=feature_extractor,
-        emotion_label_map=emotion_label_map
-    )
-
-    # Create data collator
-    data_collator = DataCollatorMTLWithPadding(
-        processor=processor,
-        tokenizer=tokenizer,
-        padding=True,
-        return_attention_mask=True
-    )
-
-    # Create model configuration
-    print("\n" + "="*50)
-    print("⚙️ Stage 4/6: Creating model configuration...")
-    print("="*50)
-    config = MTLConfig(
-        backbone_name=model_args.common_backbone_name,
-        vocab_size=tokenizer.get_vocab_size(),
-        emotion_classes=model_args.emotion_classes,
-        alpha_asr=model_args.alpha_asr,
-        alpha_prosody=model_args.alpha_prosody,
-        freeze_encoder=model_args.freeze_feature_extractor
-    )
-
-    # Create or load model
-    print("\n" + "="*50)
-    print("🤖 Stage 5/6: Creating/loading model...")
-    print("="*50)
-    if last_checkpoint is not None:
-        logger.info(f"Loading model from checkpoint {last_checkpoint}")
-        print(f"   Loading model from checkpoint {last_checkpoint}")
-        model = MTLModel.from_pretrained(last_checkpoint, config=config)
-    else:
-        logger.info("Creating new model")
-        model = MTLModel(config)
-
-        if model_args.freeze_feature_extractor:
-            model.freeze_feature_extractor()
-
-    # Log model info
-    logger.info(
-        f"Model created with {model.num_parameters(only_trainable=True):,} trainable parameters")
-    logger.info(
-        f"Total parameters: {model.num_parameters(only_trainable=False):,}")
-
-    print(f"\n📊 Model Statistics:")
-    trainable_params = model.num_parameters(only_trainable=True)
-    total_params = model.num_parameters(only_trainable=False)
-    print(f"   Trainable parameters: {trainable_params:,}")
-    print(f"   Total parameters: {total_params:,}")
-    print(f"   Model size: {total_params * 4 / (1024**2):.2f} MB")
-
-    # Create trainer
-    print("\n" + "="*50)
-    print("🎯 Stage 6/6: Setting up trainer...")
-    print("="*50)
+    # Create paper-style trainer with enhancements
     trainer = MTLTrainer(
         model=model,
-        args=training_args,
-        data_collator=data_collator,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=val_dataset if training_args.do_eval else None,
-        tokenizer=processor,
-        compute_metrics=lambda eval_pred: compute_metrics(
-            eval_pred, tokenizer),
+        device=device,
+        use_wandb=args.use_wandb,
+        use_amp=args.use_amp,
+        gradient_accumulation_steps=args.gradient_accumulation_steps
     )
 
-    # Training
-    if training_args.do_train:
-        print("\n" + "="*50)
-        print("🚂 Starting training...")
-        print("="*50)
+    print("\nPaper-style trainer created with enhanced CTC loss")
 
-        checkpoint = None
-        if training_args.resume_from_checkpoint is not None:
-            checkpoint = training_args.resume_from_checkpoint
-        elif last_checkpoint is not None:
-            checkpoint = last_checkpoint
+    # Run ablation study if requested
+    if args.run_ablation_study:
+        print("\n" + "="*60)
+        print("RUNNING ABLATION STUDY")
+        print("="*60)
 
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_model()
-
-        # Save metrics
-        metrics = train_result.metrics
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
-
-        print("\n" + "="*50)
-        print("✅ Training completed!")
-        print("="*50)
-        print("\n📊 Training Metrics:")
-        for key, value in metrics.items():
-            print(f"   {key}: {value:.4f}")
-
-    # Evaluation
-    if training_args.do_eval:
-        logger.info("*** Evaluate ***")
-        print("\n" + "="*50)
-        print("📊 Starting evaluation...")
-        print("="*50)
-        metrics = trainer.evaluate()
-
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
-
-        print("\n" + "="*50)
-        print("✅ Evaluation completed!")
-        print("="*50)
-        print("\n📊 Evaluation Metrics:")
-        for key, value in metrics.items():
-            print(f"   {key}: {value:.4f}")
-
-    # Test evaluation
-    if training_args.do_predict and data_args.test_json:
-        logger.info("*** Test ***")
-        print("\n" + "="*50)
-        print("🧪 Starting test evaluation...")
-        print("="*50)
-        test_dataset = MTLDataset(
-            datasets_dict['test'],
-            config=config,
-            feature_extractor=feature_extractor,
-            emotion_label_map=emotion_label_map
+        ablation_results, optimal_alpha = trainer.run_paper_ablation_study(
+            train_loader, val_loader, tokenizer,
+            alpha_values=args.ablation_alphas,
+            epochs_per_alpha=args.ablation_epochs,
+            save_dir=os.path.join(args.save_dir, 'ablation')
         )
 
-        predictions, labels, metrics = trainer.predict(
-            test_dataset, metric_key_prefix="test")
+        print(f"\nAblation study completed! Optimal alpha: {optimal_alpha}")
 
-        trainer.log_metrics("test", metrics)
-        trainer.save_metrics("test", metrics)
+        # Update config with optimal alpha
+        config.update_alpha_weights(optimal_alpha, optimal_alpha)
 
-        print("\n" + "="*50)
-        print("✅ Test evaluation completed!")
-        print("="*50)
-        print("\n📊 Test Metrics:")
-        for key, value in metrics.items():
-            print(f"   {key}: {value:.4f}")
+        # Log ablation results to wandb
+        if args.use_wandb:
+            wandb.log({"ablation_results": ablation_results})
+            for alpha, results in ablation_results.items():
+                wandb.log({
+                    f'ablation/alpha_{alpha}/best_accuracy': results['best_ser_accuracy'],
+                    f'ablation/alpha_{alpha}/avg_loss': results['avg_loss']
+                })
 
-    print("\n" + "="*50)
-    print("🎉 Pipeline completed successfully!")
-    print("="*50 + "\n")
+    # Main training with enhanced monitoring
+    print("\n" + "="*60)
+    print("MAIN TRAINING")
+    print("="*60)
+    print(
+        f"Current alpha values: ASR={config.alpha_asr}, Prosody={config.alpha_prosody}")
+    print(
+        f"CTC regularization: entropy={config.ctc_entropy_weight}, blank_penalty={config.ctc_blank_penalty}, threshold={config.ctc_blank_threshold}")
+
+    # Train with paper-style approach
+    trainer.train_paper_style(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=args.num_epochs,
+        tokenizer=tokenizer,
+        backbone_lr=args.backbone_lr,
+        head_lr=args.head_lr,
+        save_dir=args.save_dir,
+        early_stopping_patience=args.early_stopping_patience,
+        checkpoint_interval=args.checkpoint_interval
+    )
+
+    print_memory_usage("After training:")
+
+    # Clean up before test evaluation
+    del train_loader, val_loader
+    cleanup_memory()
+
+    # # Final evaluation on test set
+    # print("\n" + "="*60)
+    # print("FINAL TEST EVALUATION")
+    # print("="*60)
+
+    # # Load best model
+    # best_model_path = os.path.join(args.save_dir, 'best_model.pt')
+    # if os.path.exists(best_model_path):
+    #     checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+    #     model.load_state_dict(checkpoint['model_state_dict'])
+    #     print(f"Loaded best model from epoch {checkpoint['epoch']+1}")
+
+    # # Create test dataset and loader
+    # test_dataset = MTLDataset(dataset_dict['test'], config=config, feature_extractor=feature_extractor)
+    # test_loader = DataLoader(
+    #     test_dataset,
+    #     batch_size=args.batch_size * 2,  # Larger batch for test (no gradients)
+    #     shuffle=False,
+    #     collate_fn=lambda batch: collate_fn_mtl(
+    #         batch, pad_token_id=tokenizer.pad_id, tokenizer=tokenizer,
+    #         backbone_name=config.backbone_name
+    #     ),
+    #     num_workers=args.num_workers,
+    #     pin_memory=args.pin_memory and torch.cuda.is_available(),
+    #     persistent_workers=args.num_workers > 0
+    # )
+
+    # # Final evaluation with beam search for better ASR
+    # evaluator = MTLEvaluator(model, tokenizer, device, use_amp=args.use_amp, decode_method='beam')
+    # test_metrics = evaluator.evaluate(test_loader)
+    # evaluator.print_detailed_results(test_metrics)
+
+    # # Prepare comprehensive results
+    # final_results = {
+    #     'paper_methodology': 'Speech Emotion Recognition with Multi-task Learning',
+    #     'loss_formula': 'L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody',
+    #     'alpha_values': config.get_alpha_values(),
+    #     'ctc_regularization': {
+    #         'entropy_weight': config.ctc_entropy_weight,
+    #         'blank_penalty': config.ctc_blank_penalty,
+    #         'label_smoothing': config.ctc_label_smoothing,
+    #         'confidence_penalty': config.ctc_confidence_penalty
+    #     },
+    #     'test_metrics': test_metrics,
+    #     'training_summary': trainer.get_training_summary(),
+    #     'config_summary': config.get_paper_summary(),
+    #     'model_stats': {
+    #         'total_params': sum(p.numel() for p in model.parameters()),
+    #         'trainable_params': sum(p.numel() for p in model.parameters() if p.requires_grad)
+    #     }
+    # }
+
+    # # Save results
+    # results_path = os.path.join(args.save_dir, 'final_results.json')
+    # with open(results_path, 'w') as f:
+    #     json.dump(final_results, f, indent=4, cls=NumpyEncoder)
+
+    # print(f"\n✅ Training completed successfully!")
+    # print(f"Results saved to: {args.save_dir}")
+
+    # # Extract and display key metrics
+    # ser_accuracy = test_metrics.get('emotion', {}).get('accuracy', 0.0)
+    # asr_wer = test_metrics.get('asr', {}).get('wer', 1.0)
+    # prosody_accuracy = test_metrics.get('prosody', {}).get('accuracy', 0.0)
+
+    # print(f"\n📊 FINAL RESULTS:")
+    # print(f"  SER Accuracy (main task): {ser_accuracy:.4f}")
+    # print(f"  ASR WER (auxiliary): {asr_wer:.4f}")
+    # print(f"  Prosody Accuracy (auxiliary): {prosody_accuracy:.4f}")
+    # print(f"  Alpha values: ASR={config.alpha_asr}, Prosody={config.alpha_prosody}")
+
+    # # Log final results to wandb
+    # if args.use_wandb:
+    #     wandb.log({
+    #         'test/final_ser_accuracy': ser_accuracy,
+    #         'test/final_asr_wer': asr_wer,
+    #         'test/final_prosody_accuracy': prosody_accuracy
+    #     })
+
+    #     # Log a summary table
+    #     wandb.run.summary['best_ser_accuracy'] = ser_accuracy
+    #     wandb.run.summary['best_asr_wer'] = asr_wer
+    #     wandb.run.summary['optimal_alpha'] = config.alpha_asr
+
+    #     wandb.finish()
+
+    print_memory_usage("Final memory usage:")
+
+    # return final_results
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        # final_results = main()
+        main()
+        print("\n🎉 Training script completed successfully!")
+        exit(0)
+    except KeyboardInterrupt:
+        print("\n⚠️ Training interrupted by user")
+        if wandb.run is not None:
+            wandb.finish()
+        exit(1)
+    except Exception as e:
+        print(f"\n❌ Training failed with error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        if wandb.run is not None:
+            wandb.finish()
+        exit(1)

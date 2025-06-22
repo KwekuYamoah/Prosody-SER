@@ -4,16 +4,12 @@ Handles model evaluation, metric computation, and result visualization
 """
 
 import torch
-from torch.utils.data import DataLoader
-
 import numpy as np
 from tqdm import tqdm
-
 from sklearn.metrics import accuracy_score, f1_score
-from typing import Dict, List, Optional
-
 from jiwer import wer, cer
-
+from typing import Dict, List, Optional
+from torch.utils.data import DataLoader
 import gc
 
 from sample_code.scripts.ctc_decoder import CTCDecoder

@@ -1,6 +1,7 @@
 """
-MTL Trainer Module with Paper-Style Alpha Control
-Handles model training with SER as main task and ASR/Prosody as auxiliary tasks
+MTL Trainer Module
+Paper-style trainer with proper alpha control and backbone handling
+Following "Speech Emotion Recognition with Multi-task Learning" methodology
 """
 
 import torch
@@ -8,44 +9,100 @@ import os
 import json
 from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.cuda.amp import GradScaler
 from typing import Dict, Optional
 import wandb
 
-from .evaluator import MTLEvaluator
-from .utils import NumpyEncoder
+from sample_code.training.evaluator import MTLEvaluator
+from sample_code.training.utils import NumpyEncoder
+from sample_code.scripts.mtl_model import MTLModel
 
 
 class MTLTrainer:
-    """Enhanced trainer class with paper-style alpha control for auxiliary tasks"""
-
-    def __init__(self, model, device='cuda', use_wandb=False, use_amp=True, gradient_accumulation_steps=1):
+    """
+    Paper-style trainer for MTL with proper alpha control and backbone handling.
+    
+    Key features:
+    - Paper-style optimizer with differential learning rates
+    - Enhanced training step with AMP support
+    - Alpha experimentation support
+    - Proper logging following paper's methodology
+    """
+    
+    def __init__(self, model: MTLModel, device='cuda', use_wandb=False, use_amp=True, gradient_accumulation_steps=1):
         self.model = model
         self.device = device
-        self.model.to(device)
         self.use_wandb = use_wandb
         self.use_amp = use_amp
         self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.scaler = torch.amp.GradScaler(enabled=use_amp)
+        self.scaler = GradScaler(enabled=use_amp)
+        self.model.to(device)
+        
+        # Training history
         self.history = {
-            'train_loss': [], 'val_loss': [],
-            'train_metrics': [], 'val_metrics': [],
-            'alpha_history': []  # Track alpha values over time
+            'train_loss': [], 'val_loss': [], 'train_metrics': [], 'val_metrics': [],
+            'alpha_history': [], 'task_loss_history': []
         }
 
-    def train_step(self, batch):
-        """Single training step"""
-        self.model.train()
+        print(f"Paper-style MTL Trainer initialized:")
+        print(f"  Device: {device}")
+        print(f"  AMP enabled: {use_amp}")
+        print(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
+        print(f"  W&B logging: {use_wandb}")
 
+    def create_paper_style_optimizer(self, backbone_lr: float = 1e-5, head_lr: float = 5e-5) -> torch.optim.Optimizer:
+        """
+        Create optimizer following paper's approach:
+        - Lower learning rate for backbone (fine-tuning)
+        - Higher learning rate for task heads (from scratch)
+        """
+        param_groups = []
+        
+        # Backbone parameters (lower LR for fine-tuning)
+        backbone_params = list(self.model.backbone.parameters())
+        if backbone_params:
+            param_groups.append({
+                'params': backbone_params,
+                'lr': backbone_lr,
+                'name': 'backbone'
+            })
+        
+        # Task head parameters (higher LR)
+        head_params = []
+        for name, module in self.model.named_children():
+            if name != 'backbone':  # All non-backbone modules
+                head_params.extend(list(module.parameters()))
+        
+        if head_params:
+            param_groups.append({
+                'params': head_params,
+                'lr': head_lr,
+                'name': 'task_heads'
+            })
+        
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01, eps=1e-8)
+        
+        print(f"Paper-style optimizer created:")
+        print(f"  Backbone LR: {backbone_lr}")
+        print(f"  Task heads LR: {head_lr}")
+        print(f"  Parameter groups: {len(param_groups)}")
+        
+        return optimizer
+
+    def train_step(self, batch):
+        """Single training step following paper's methodology"""
+        self.model.train()
+        
         # Move batch to device
         input_features = batch['input_features'].to(self.device)
-        asr_targets = batch['asr_targets'].to(
-            self.device) if torch.is_tensor(batch['asr_targets']) else None
+        asr_targets = batch['asr_targets'].to(self.device) if torch.is_tensor(batch['asr_targets']) else None
         asr_lengths = batch['asr_lengths'].to(self.device)
         prosody_targets = batch['prosody_targets'].to(self.device)
         emotion_targets = batch['emotion_targets'].to(self.device)
 
+        # Forward pass with AMP if enabled
         if self.use_amp:
-            with torch.amp.autocast(device_type="cuda", enabled=self.use_amp):
+            with torch.amp.autocast(device_type="cuda"):
                 outputs = self.model(
                     input_features=input_features,
                     asr_targets=asr_targets,
@@ -66,10 +123,10 @@ class MTLTrainer:
 
         return outputs
 
-    def train_epoch_with_alpha_logging(self, train_loader, optimizer, scheduler=None):
-        """Train for one epoch with alpha value logging"""
+    def train_epoch(self, train_loader, optimizer, scheduler=None):
+        """Train for one epoch with gradient accumulation"""
         epoch_losses = {'total': 0, 'ser': 0, 'asr': 0, 'prosody': 0}
-        alpha_values = {'alpha_asr': 0, 'alpha_prosody': 0}
+        ctc_stats_epoch = []
         num_batches = 0
 
         # Zero gradients at the start
@@ -91,32 +148,38 @@ class MTLTrainer:
             # Update weights after accumulating gradients
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
                 if self.use_amp:
+                    # Unscale gradients before clipping
                     self.scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                    # Clip gradients to prevent exploding gradients
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    # Step optimizer
                     self.scaler.step(optimizer)
                     self.scaler.update()
                 else:
+                    # Clip gradients
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     optimizer.step()
 
+                # Step scheduler if provided
                 if scheduler is not None:
                     scheduler.step()
 
+                # Zero gradients for next accumulation
                 optimizer.zero_grad()
 
-            # Accumulate losses
+            # Accumulate losses (multiply back to get actual loss value)
             epoch_losses['total'] += total_loss.item() * self.gradient_accumulation_steps
             if 'emotion_loss' in outputs:
                 epoch_losses['ser'] += outputs['emotion_loss'].item()
             if 'asr_loss' in outputs:
                 epoch_losses['asr'] += outputs['asr_loss'].item()
+                
+                # Track CTC statistics
+                if 'loss_details' in outputs and 'asr' in outputs['loss_details']:
+                    ctc_stats_epoch.append(outputs['loss_details']['asr'])
+                    
             if 'prosody_loss' in outputs:
                 epoch_losses['prosody'] += outputs['prosody_loss'].item()
-
-            # Track alpha values
-            if 'alpha_values' in outputs:
-                alpha_values['alpha_asr'] = outputs['alpha_values']['alpha_asr']
-                alpha_values['alpha_prosody'] = outputs['alpha_values']['alpha_prosody']
 
             num_batches += 1
 
@@ -124,230 +187,21 @@ class MTLTrainer:
             if batch_idx % 50 == 0:
                 torch.cuda.empty_cache()
 
+            # Delete references to free memory
             del batch, outputs, total_loss
 
         # Average losses
         for key in epoch_losses:
             epoch_losses[key] /= num_batches
 
-        return epoch_losses, alpha_values
+        # Average CTC statistics
+        avg_ctc_stats = {}
+        if ctc_stats_epoch:
+            for key in ctc_stats_epoch[0].keys():
+                avg_ctc_stats[key] = sum(stats[key] for stats in ctc_stats_epoch) / len(ctc_stats_epoch)
+            epoch_losses['ctc_stats'] = avg_ctc_stats
 
-    def train_with_alpha_control(
-        self,
-        train_loader,
-        val_loader,
-        optimizer,
-        num_epochs,
-        tokenizer,
-        save_dir='checkpoints',
-        early_stopping_patience=5,
-        checkpoint_interval=10,
-        alpha_asr=0.1,
-        alpha_prosody=0.1
-    ):
-        """Training loop with fixed alpha values following the paper"""
-        os.makedirs(save_dir, exist_ok=True)
-        best_val_loss = float('inf')
-        patience_counter = 0
-        best_epoch = 0
-
-        print(f"\nStarting training with paper-style alpha control:")
-        print(f"  SER (main task): weight = 1.0")
-        print(f"  ASR (auxiliary): alpha = {alpha_asr}")
-        print(f"  Prosody (auxiliary): alpha = {alpha_prosody}")
-
-        # Update model's alpha values
-        self.model.config.update_alpha_weights(alpha_asr, alpha_prosody)
-
-        for epoch in range(num_epochs):
-            print(f"\nEpoch {epoch + 1}/{num_epochs}")
-
-            # Training
-            train_losses, alpha_vals = self.train_epoch_with_alpha_logging(train_loader, optimizer)
-
-            # Validation
-            evaluator = MTLEvaluator(
-                self.model, tokenizer, self.device, self.use_amp, decode_method='greedy')
-            val_metrics = evaluator.evaluate(val_loader)
-            val_losses = self.evaluate_loss(val_loader)
-
-            # Log metrics
-            metrics = {
-                'epoch': epoch,
-                'train_total_loss': train_losses['total'],
-                'val_total_loss': val_losses['total'],
-                'alpha_asr': alpha_vals['alpha_asr'],
-                'alpha_prosody': alpha_vals['alpha_prosody']
-            }
-
-            for task in ['ser', 'asr', 'prosody']:
-                task_map = {'ser': 'emotion', 'asr': 'asr', 'prosody': 'prosody'}
-                actual_task = task_map[task]
-                
-                if task in train_losses:
-                    metrics[f'train_{task}_loss'] = train_losses[task]
-                if task in val_losses:
-                    metrics[f'val_{task}_loss'] = val_losses[task]
-                if actual_task in val_metrics:
-                    for metric_name, value in val_metrics[actual_task].items():
-                        if metric_name != 'detailed_results':
-                            metrics[f'val_{task}_{metric_name}'] = value
-
-            if self.use_wandb:
-                wandb.log(metrics)
-
-            # Print epoch summary
-            print(f"\nEpoch {epoch + 1} Results:")
-            print(f"  Train Loss: {train_losses['total']:.4f}")
-            print(f"  Val Loss: {val_losses['total']:.4f}")
-            print(f"  Alpha ASR: {alpha_vals['alpha_asr']}, Alpha Prosody: {alpha_vals['alpha_prosody']}")
-            
-            evaluator.print_detailed_results(val_metrics)
-
-            # Save history
-            self.history['train_loss'].append(train_losses)
-            self.history['val_loss'].append(val_losses)
-            self.history['train_metrics'].append(metrics)
-            self.history['val_metrics'].append(val_metrics)
-            self.history['alpha_history'].append(alpha_vals)
-
-            # Check for best model and save
-            if val_losses['total'] < best_val_loss:
-                best_val_loss = val_losses['total']
-                best_epoch = epoch
-                patience_counter = 0
-                self.save_checkpoint(os.path.join(save_dir, 'best_model.pt'), epoch, optimizer, None, is_best=True)
-                print(f"  New best model saved! (Val Loss: {best_val_loss:.4f})")
-            else:
-                patience_counter += 1
-
-            # Save checkpoint at specified intervals
-            if (epoch + 1) % checkpoint_interval == 0 and epoch != best_epoch:
-                checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pt')
-                self.save_checkpoint(checkpoint_path, epoch, optimizer, None)
-                print(f"  Checkpoint saved at epoch {epoch+1}")
-
-            # Early stopping
-            if patience_counter >= early_stopping_patience:
-                print(f"\nEarly stopping triggered after {epoch + 1} epochs")
-                break
-
-        self.save_history(os.path.join(save_dir, 'training_history.json'))
-
-    def train_with_freeze_unfreeze_alpha(
-        self,
-        train_loader,
-        val_loader,
-        num_epochs,
-        tokenizer,
-        base_lr=1e-4,
-        save_dir='checkpoints',
-        early_stopping_patience=7,
-        checkpoint_interval=5,
-        unfreeze_epoch_ratio=0.5,
-        lr_reduction_factor=0.1,
-        alpha_asr=0.1,
-        alpha_prosody=0.1
-    ):
-        """Enhanced training with freeze/unfreeze strategy and paper-style alpha control"""
-        os.makedirs(save_dir, exist_ok=True)
-        best_val_loss = float('inf')
-        patience_counter = 0
-        best_epoch = 0
-        unfreeze_epoch = int(num_epochs * unfreeze_epoch_ratio)
-
-        print(f"\nPaper-Style Enhanced Training Configuration:")
-        print(f"  Total epochs: {num_epochs}")
-        print(f"  Unfreeze at epoch: {unfreeze_epoch}")
-        print(f"  SER (main task): weight = 1.0")
-        print(f"  ASR (auxiliary): alpha = {alpha_asr}")
-        print(f"  Prosody (auxiliary): alpha = {alpha_prosody}")
-
-        # Update model's alpha values
-        self.model.config.update_alpha_weights(alpha_asr, alpha_prosody)
-
-        # Freeze encoder initially
-        if self.model.config.freeze_encoder:
-            self.model.backbone.freeze_encoder()
-            print(f"  Trainable parameters: {self.model.backbone.get_num_trainable_params():,}")
-
-        # Create optimizer with differential learning rates
-        optimizer = self.create_optimizer_with_differential_lr(
-            self.model,
-            base_lr=base_lr,
-            asr_lr_multiplier=self.model.config.asr_lr_multiplier
-        )
-
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
-
-        for epoch in range(num_epochs):
-            print(f"\n{'='*50}")
-            print(f"Epoch {epoch + 1}/{num_epochs}")
-            print(f"{'='*50}")
-
-            # Check if we should unfreeze
-            if epoch == unfreeze_epoch and self.model.backbone.is_frozen():
-                print(f"\n⚡ Unfreezing encoder at epoch {epoch + 1}")
-                self.model.backbone.unfreeze_encoder()
-
-                # Reduce learning rate for all parameters
-                for param_group in optimizer.param_groups:
-                    old_lr = param_group['lr']
-                    param_group['lr'] *= lr_reduction_factor
-                    print(f"  {param_group['name']} LR: {old_lr:.2e} → {param_group['lr']:.2e}")
-
-                print(f"  Trainable parameters: {self.model.backbone.get_num_trainable_params():,}")
-
-            # Training
-            train_losses, alpha_vals = self.train_epoch_with_alpha_logging(train_loader, optimizer)
-
-            # Validation
-            evaluator = MTLEvaluator(
-                self.model, tokenizer, self.device, self.use_amp, decode_method='greedy')
-            val_metrics = evaluator.evaluate(val_loader)
-            val_losses = self.evaluate_loss(val_loader)
-
-            scheduler.step(val_losses['total'])
-
-            # Print results
-            print(f"\nEpoch {epoch + 1} Results:")
-            print(f"  Train Loss: {train_losses['total']:.4f}")
-            print(f"  Val Loss: {val_losses['total']:.4f}")
-            print(f"  Alpha Values - ASR: {alpha_vals['alpha_asr']}, Prosody: {alpha_vals['alpha_prosody']}")
-            evaluator.print_detailed_results(val_metrics)
-
-            # Update history
-            self.history['train_loss'].append(train_losses)
-            self.history['val_loss'].append(val_losses)
-            self.history['val_metrics'].append(val_metrics)
-            self.history['alpha_history'].append(alpha_vals)
-
-            # Save best model
-            if val_losses['total'] < best_val_loss:
-                best_val_loss = val_losses['total']
-                best_epoch = epoch
-                patience_counter = 0
-                self.save_checkpoint(
-                    os.path.join(save_dir, 'best_model.pt'),
-                    epoch, optimizer, scheduler, is_best=True
-                )
-                print(f"\n🎯 New best model saved! (Val Loss: {best_val_loss:.4f})")
-            else:
-                patience_counter += 1
-
-            # Periodic checkpoints
-            if (epoch + 1) % checkpoint_interval == 0:
-                checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pt')
-                self.save_checkpoint(checkpoint_path, epoch, optimizer, scheduler)
-                print(f"💾 Checkpoint saved at epoch {epoch+1}")
-
-            # Early stopping
-            if patience_counter >= early_stopping_patience:
-                print(f"\n⏹️ Early stopping triggered after {epoch + 1} epochs")
-                break
-
-        # Save training history
-        self.save_history(os.path.join(save_dir, 'training_history.json'))
+        return epoch_losses
 
     def evaluate_loss(self, data_loader):
         """Evaluate loss on a data loader"""
@@ -357,9 +211,9 @@ class MTLTrainer:
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(data_loader):
+                # Move batch to device
                 input_features = batch['input_features'].to(self.device)
-                asr_targets = batch['asr_targets'].to(
-                    self.device) if torch.is_tensor(batch['asr_targets']) else None
+                asr_targets = batch['asr_targets'].to(self.device) if torch.is_tensor(batch['asr_targets']) else None
                 asr_lengths = batch['asr_lengths'].to(self.device)
                 prosody_targets = batch['prosody_targets'].to(self.device)
                 emotion_targets = batch['emotion_targets'].to(self.device)
@@ -398,6 +252,7 @@ class MTLTrainer:
                 if batch_idx % 20 == 0:
                     torch.cuda.empty_cache()
 
+                # Delete references
                 del batch, outputs
 
         # Average losses
@@ -406,31 +261,278 @@ class MTLTrainer:
 
         return losses
 
-    def create_optimizer_with_differential_lr(self, model, base_lr: float,
-                                              asr_lr_multiplier: float = 0.1) -> torch.optim.Optimizer:
-        """Create optimizer with different learning rates for ASR head"""
-        asr_params = []
-        other_params = []
+    def train_paper_style(self, train_loader, val_loader, num_epochs, tokenizer, 
+                         backbone_lr=1e-5, head_lr=5e-5, save_dir='checkpoints',
+                         early_stopping_patience=10, checkpoint_interval=5):
+        """
+        Complete training loop following paper's methodology.
+        
+        Args:
+            train_loader: Training data loader
+            val_loader: Validation data loader
+            num_epochs: Number of training epochs
+            tokenizer: Tokenizer for ASR evaluation
+            backbone_lr: Learning rate for backbone (fine-tuning)
+            head_lr: Learning rate for task heads (training from scratch)
+            save_dir: Directory to save checkpoints
+            early_stopping_patience: Patience for early stopping
+            checkpoint_interval: Save checkpoint every N epochs
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        best_val_loss = float('inf')
+        best_ser_accuracy = 0.0
+        patience_counter = 0
+        best_epoch = 0
 
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                if 'asr_head' in name or 'asr_layer_norm' in name:
-                    asr_params.append(param)
-                else:
-                    other_params.append(param)
+        print(f"\n{'='*60}")
+        print(f"PAPER-STYLE MTL TRAINING")
+        print(f"{'='*60}")
+        print(f"Main task: SER (weight = 1.0)")
+        print(f"Auxiliary tasks: ASR (α = {self.model.config.alpha_asr}), Prosody (α = {self.model.config.alpha_prosody})")
+        print(f"Loss formula: L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody")
+        print(f"Total epochs: {num_epochs}")
+        print(f"Backbone LR: {backbone_lr}, Head LR: {head_lr}")
 
-        param_groups = []
-        if other_params:
-            param_groups.append(
-                {'params': other_params, 'lr': base_lr, 'name': 'other'})
-        if asr_params:
-            param_groups.append(
-                {'params': asr_params, 'lr': base_lr * asr_lr_multiplier, 'name': 'asr'})
+        # Create paper-style optimizer
+        optimizer = self.create_paper_style_optimizer(backbone_lr, head_lr)
+        
+        # Create scheduler
+        scheduler = ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, verbose=True, min_lr=1e-7
+        )
 
-        return torch.optim.AdamW(param_groups, weight_decay=0.01, eps=1e-8)
+        for epoch in range(num_epochs):
+            print(f"\n{'='*50}")
+            print(f"Epoch {epoch + 1}/{num_epochs}")
+            print(f"{'='*50}")
+
+            # Training
+            train_losses = self.train_epoch(train_loader, optimizer, None)
+
+            # Print CTC loss details if available
+            if 'ctc_stats' in train_losses:
+                print(f"\nCTC Statistics:")
+                ctc_stats = train_losses['ctc_stats']
+                print(f"  CTC Loss: {ctc_stats.get('ctc_loss', 0):.4f}")
+                print(f"  Entropy Loss: {ctc_stats.get('entropy_loss', 0):.4f}")
+                print(f"  Blank Penalty: {ctc_stats.get('blank_penalty', 0):.4f}")
+
+            # Validation
+            evaluator = MTLEvaluator(
+                self.model, tokenizer, self.device, self.use_amp, decode_method='greedy'
+            )
+            val_metrics = evaluator.evaluate(val_loader)
+            val_losses = self.evaluate_loss(val_loader)
+
+            # Update scheduler
+            scheduler.step(val_losses['total'])
+
+            # Print results
+            print(f"\nEpoch {epoch + 1} Results:")
+            print(f"  Train Loss: {train_losses['total']:.4f}")
+            print(f"    SER: {train_losses['ser']:.4f} (main task)")
+            print(f"    ASR: {train_losses['asr']:.4f} (α={self.model.config.alpha_asr})")
+            print(f"    Prosody: {train_losses['prosody']:.4f} (α={self.model.config.alpha_prosody})")
+            print(f"  Val Loss: {val_losses['total']:.4f}")
+            
+            # Print validation metrics
+            ser_accuracy = 0.0
+            evaluator.print_detailed_results(val_metrics)
+            
+            # Extract SER accuracy for best model tracking
+            if 'emotion' in val_metrics and 'accuracy' in val_metrics['emotion']:
+                ser_accuracy = val_metrics['emotion']['accuracy']
+
+            # Update history
+            self.history['train_loss'].append(train_losses)
+            self.history['val_loss'].append(val_losses)
+            self.history['val_metrics'].append(val_metrics)
+            self.history['alpha_history'].append(self.model.config.get_alpha_values())
+
+            # Log to wandb if enabled
+            if self.use_wandb:
+                self.log_paper_style_metrics(
+                    {
+                        'total_loss': torch.tensor(train_losses['total']),
+                        'emotion_loss': torch.tensor(train_losses['ser']),
+                        'asr_loss': torch.tensor(train_losses['asr']),
+                        'prosody_loss': torch.tensor(train_losses['prosody']),
+                        'alpha_values': self.model.config.get_alpha_values()
+                    },
+                    epoch, 'train'
+                )
+                
+                wandb.log({
+                    'epoch': epoch,
+                    'train_total_loss': train_losses['total'],
+                    'val_total_loss': val_losses['total'],
+                    'val_ser_accuracy': ser_accuracy,
+                    'alpha_asr': self.model.config.alpha_asr,
+                    'alpha_prosody': self.model.config.alpha_prosody
+                })
+
+            # Check for best model (prioritize SER accuracy as main task)
+            if ser_accuracy > best_ser_accuracy:
+                best_ser_accuracy = ser_accuracy
+                best_epoch = epoch
+                patience_counter = 0
+                self.save_checkpoint(
+                    os.path.join(save_dir, 'best_model.pt'),
+                    epoch, optimizer, scheduler, is_best=True
+                )
+                print(f"\n🎯 New best SER accuracy: {best_ser_accuracy:.4f} (saved)")
+            else:
+                patience_counter += 1
+
+            # Periodic checkpoints
+            if (epoch + 1) % checkpoint_interval == 0:
+                checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pt')
+                self.save_checkpoint(checkpoint_path, epoch, optimizer, scheduler)
+                print(f"💾 Checkpoint saved at epoch {epoch+1}")
+
+            # Early stopping
+            if patience_counter >= early_stopping_patience:
+                print(f"\n⏹️ Early stopping triggered after {epoch + 1} epochs")
+                break
+
+        # Copy best model to final
+        best_path = os.path.join(save_dir, 'best_model.pt')
+        final_path = os.path.join(save_dir, 'final_model.pt')
+        if os.path.exists(best_path):
+            import shutil
+            shutil.copy2(best_path, final_path)
+            print(f"\n✅ Best model (epoch {best_epoch + 1}) copied to final_model.pt")
+
+        # Save training history
+        self.save_history(os.path.join(save_dir, 'training_history.json'))
+
+        print(f"\n🎉 Paper-style training completed!")
+        print(f"Best SER accuracy: {best_ser_accuracy:.4f} at epoch {best_epoch + 1}")
+
+    def run_paper_ablation_study(self, train_loader, val_loader, tokenizer, 
+                                alpha_values=[0.0, 0.001, 0.01, 0.1, 1.0],
+                                epochs_per_alpha=5, save_dir='ablation_results'):
+        """
+        Run ablation study following paper's methodology.
+        Tests different alpha values to find optimal auxiliary task contribution.
+        """
+        print(f"\n{'='*60}")
+        print(f"PAPER-STYLE ABLATION STUDY")
+        print(f"{'='*60}")
+        print(f"Testing alpha values: {alpha_values}")
+        print(f"Epochs per alpha: {epochs_per_alpha}")
+        
+        os.makedirs(save_dir, exist_ok=True)
+        ablation_results = {}
+        
+        for alpha in alpha_values:
+            print(f"\n--- Testing Alpha = {alpha} ---")
+            
+            # Update model's alpha values
+            self.model.update_alpha_values(alpha, alpha)  # Same alpha for both auxiliary tasks
+            
+            # Create optimizer for this alpha configuration
+            optimizer = self.create_paper_style_optimizer(backbone_lr=1e-5, head_lr=5e-5)
+            
+            # Reset model state for fair comparison
+            # Note: In practice, you might want to start from a pre-trained checkpoint
+            
+            best_ser_acc = 0.0
+            alpha_losses = []
+            
+            for epoch in range(epochs_per_alpha):
+                # Training
+                train_losses = self.train_epoch(train_loader, optimizer)
+                
+                # Quick evaluation
+                self.model.eval()
+                with torch.no_grad():
+                    evaluator = MTLEvaluator(
+                        self.model, tokenizer, self.device, self.use_amp, decode_method='greedy'
+                    )
+                    val_metrics = evaluator.evaluate(val_loader)
+                    ser_acc = val_metrics.get('emotion', {}).get('accuracy', 0.0)
+                    
+                    if ser_acc > best_ser_acc:
+                        best_ser_acc = ser_acc
+                    
+                    alpha_losses.append(train_losses['total'])
+                
+                print(f"  Epoch {epoch+1}: SER Acc = {ser_acc:.4f}, Loss = {train_losses['total']:.4f}")
+            
+            ablation_results[alpha] = {
+                'best_ser_accuracy': best_ser_acc,
+                'final_ser_accuracy': ser_acc,
+                'avg_loss': sum(alpha_losses) / len(alpha_losses),
+                'loss_history': alpha_losses
+            }
+            
+            print(f"Alpha {alpha} -> Best SER Accuracy: {best_ser_acc:.4f}")
+            
+            # Log to wandb if enabled
+            if self.use_wandb:
+                wandb.log({
+                    f'ablation_alpha_{alpha}_best_accuracy': best_ser_acc,
+                    f'ablation_alpha_{alpha}_avg_loss': ablation_results[alpha]['avg_loss']
+                })
+        
+        # Find optimal alpha
+        best_alpha = max(ablation_results.keys(), 
+                        key=lambda a: ablation_results[a]['best_ser_accuracy'])
+        
+        print(f"\n🎯 ABLATION STUDY RESULTS:")
+        print(f"{'Alpha':<8} {'Best Acc':<10} {'Avg Loss':<10}")
+        print("-" * 30)
+        for alpha in alpha_values:
+            results = ablation_results[alpha]
+            marker = " <- BEST" if alpha == best_alpha else ""
+            print(f"{alpha:<8} {results['best_ser_accuracy']:<10.4f} {results['avg_loss']:<10.4f}{marker}")
+        
+        print(f"\n🏆 Optimal Alpha: {best_alpha}")
+        print(f"   Best SER Accuracy: {ablation_results[best_alpha]['best_ser_accuracy']:.4f}")
+        print(f"   Paper's optimal: 0.1 (for comparison)")
+        
+        # Save ablation results
+        ablation_path = os.path.join(save_dir, 'ablation_results.json')
+        with open(ablation_path, 'w') as f:
+            json.dump(ablation_results, f, indent=4)
+        
+        # Set model to optimal alpha
+        self.model.update_alpha_values(best_alpha, best_alpha)
+        
+        return ablation_results, best_alpha
+
+    def log_paper_style_metrics(self, outputs, epoch, mode='train'):
+        """Log metrics following paper's reporting style"""
+        if self.use_wandb:
+            log_dict = {
+                f'{mode}_total_loss': outputs['total_loss'].item(),
+                'epoch': epoch
+            }
+            
+            # Individual task losses
+            if 'emotion_loss' in outputs:
+                log_dict[f'{mode}_ser_loss'] = outputs['emotion_loss'].item()
+            if 'asr_loss' in outputs:
+                log_dict[f'{mode}_asr_loss'] = outputs['asr_loss'].item()
+            if 'prosody_loss' in outputs:
+                log_dict[f'{mode}_prosody_loss'] = outputs['prosody_loss'].item()
+            
+            # Alpha values
+            if 'alpha_values' in outputs:
+                for key, value in outputs['alpha_values'].items():
+                    log_dict[f'alpha_{key}'] = value
+            
+            # CTC regularization details
+            if 'loss_details' in outputs and 'asr' in outputs['loss_details']:
+                asr_details = outputs['loss_details']['asr']
+                for key, value in asr_details.items():
+                    log_dict[f'asr_{key}'] = value
+            
+            wandb.log(log_dict)
 
     def save_checkpoint(self, path, epoch, optimizer, scheduler=None, is_best=False):
-        """Save complete checkpoint with optimizer state and alpha values"""
+        """Save complete checkpoint with optimizer state"""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -439,10 +541,8 @@ class MTLTrainer:
             'is_best': is_best,
             'history': self.history,
             'gradient_accumulation_steps': self.gradient_accumulation_steps,
-            'alpha_values': {
-                'alpha_asr': self.model.config.alpha_asr,
-                'alpha_prosody': self.model.config.alpha_prosody
-            }
+            'alpha_values': self.model.config.get_alpha_values(),
+            'paper_info': self.model.get_paper_training_info()
         }
 
         if scheduler is not None:
@@ -450,9 +550,6 @@ class MTLTrainer:
 
         if self.use_amp and self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
-
-        if hasattr(self.model.backbone, 'is_frozen'):
-            checkpoint['is_encoder_frozen'] = self.model.backbone.is_frozen()
 
         torch.save(checkpoint, path)
 
@@ -462,8 +559,7 @@ class MTLTrainer:
             checkpoint = torch.load(path, map_location=self.device)
         except Exception as e:
             if "weights_only" in str(e):
-                checkpoint = torch.load(
-                    path, map_location=self.device, weights_only=False)
+                checkpoint = torch.load(path, map_location=self.device, weights_only=False)
             else:
                 raise e
 
@@ -484,45 +580,33 @@ class MTLTrainer:
         if 'gradient_accumulation_steps' in checkpoint:
             self.gradient_accumulation_steps = checkpoint['gradient_accumulation_steps']
 
-        # Restore alpha values
+        # Restore alpha values if available
         if 'alpha_values' in checkpoint:
             alpha_vals = checkpoint['alpha_values']
-            self.model.config.update_alpha_weights(
-                alpha_vals['alpha_asr'], 
-                alpha_vals['alpha_prosody']
+            self.model.update_alpha_values(
+                alpha_vals.get('alpha_asr', 0.1),
+                alpha_vals.get('alpha_prosody', 0.1)
             )
-            print(f"Restored alpha values: ASR={alpha_vals['alpha_asr']}, Prosody={alpha_vals['alpha_prosody']}")
-
-        # Restore freeze status if available
-        if 'is_encoder_frozen' in checkpoint and checkpoint['is_encoder_frozen']:
-            if hasattr(self.model.backbone, 'freeze_encoder'):
-                self.model.backbone.freeze_encoder()
 
         return checkpoint.get('epoch', 0)
 
     def save_history(self, path):
-        """Save training history with alpha tracking"""
+        """Save training history"""
         with open(path, 'w', encoding='utf-8') as f:
-            json.dump(self.history, f, indent=4,
-                      ensure_ascii=False, cls=NumpyEncoder)
+            json.dump(self.history, f, indent=4, ensure_ascii=False, cls=NumpyEncoder)
 
-    def get_alpha_summary(self) -> dict:
-        """Get summary of alpha values used during training"""
-        if not self.history['alpha_history']:
-            return {}
-        
-        alpha_asr_values = [h['alpha_asr'] for h in self.history['alpha_history']]
-        alpha_prosody_values = [h['alpha_prosody'] for h in self.history['alpha_history']]
-        
+    def get_training_summary(self):
+        """Get summary of training configuration and results"""
         return {
-            'alpha_asr': {
-                'final': alpha_asr_values[-1] if alpha_asr_values else 0,
-                'mean': sum(alpha_asr_values) / len(alpha_asr_values) if alpha_asr_values else 0,
-                'constant': len(set(alpha_asr_values)) == 1
+            'model_info': self.model.get_paper_training_info(),
+            'training_config': {
+                'device': str(self.device),
+                'use_amp': self.use_amp,
+                'gradient_accumulation_steps': self.gradient_accumulation_steps,
+                'use_wandb': self.use_wandb
             },
-            'alpha_prosody': {
-                'final': alpha_prosody_values[-1] if alpha_prosody_values else 0,
-                'mean': sum(alpha_prosody_values) / len(alpha_prosody_values) if alpha_prosody_values else 0,
-                'constant': len(set(alpha_prosody_values)) == 1
-            }
+            'current_alpha_values': self.model.config.get_alpha_values(),
+            'loss_formula': 'L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody',
+            'training_history_length': len(self.history['train_loss']),
+            'paper_reference': 'Speech Emotion Recognition with Multi-task Learning'
         }
