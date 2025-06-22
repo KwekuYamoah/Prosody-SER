@@ -27,8 +27,8 @@ class MTLConfig:
     # Enhanced CTC regularization parameters
     # Entropy regularization to prevent overconfidence
     ctc_entropy_weight: float = 0.01
-    # Direct penalty for excessive blank predictions
-    ctc_blank_penalty: float = 0.1
+    # Very strong penalty for excessive blank predictions (increased to 50.0)
+    ctc_blank_penalty: float = 50.0
     # Threshold for blank penalty (much more reasonable than 0.8)
     ctc_blank_threshold: float = 0.3
     ctc_label_smoothing: float = 0.0    # Label smoothing for CTC loss
@@ -196,13 +196,8 @@ class MTLConfig:
             backbone_name=backbone_name,
             alpha_asr=alpha_asr,
             alpha_prosody=alpha_prosody,
-            # Paper-style training settings
-            backbone_learning_rate=1e-5,
-            task_head_learning_rate=5e-5,
-            freeze_backbone_initially=False,
-            # CTC regularization to fix blank prediction
             ctc_entropy_weight=0.01,
-            ctc_blank_penalty=0.1,
+            ctc_blank_penalty=50.0,  # Very strong penalty for lower threshold
             ctc_blank_threshold=0.3,
             ctc_label_smoothing=0.0,
             ctc_confidence_penalty=0.0

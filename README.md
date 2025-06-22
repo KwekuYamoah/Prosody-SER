@@ -59,18 +59,16 @@ The training script supports various command-line arguments for customization:
 python -m sample_code.scripts.train \
     --audio_base_path "./AUDIO/" \
     --train_jsonl "./json_data/ser_audio_features_wav_train.jsonl" \
-    --val_jsonl "./json_data/ser_audio_features_wav_train.jsonl" \
+    --val_jsonl "./json_data/ser_audio_features_wav_val.jsonl" \
     --test_jsonl "./json_data/ser_audio_features_wav_test.jsonl" \
     --backbone whisper \
-    --batch_size 2 \
+    --batch_size 16 \
     --vocab_size 16000 \
-    --num_epochs 6 \
-    --lr 1e-4 \
+    --num_epochs 100 \
     --save_dir "checkpoints" \
     --tokenizer_path "akan_mtl_tokenizer.model" \
-    --gradient_accumulation_steps 8 \
     --use_amp \
-    --use_enhanced_training
+    --use_wandb
 ```
 
 #### Command-line Arguments
@@ -136,27 +134,37 @@ The evaluation script will generate:
 #### Google Colab
 
 ```bash
-python sample_code/train_mtl.py \
+python -m sample_code.scripts.train \
     --audio_base_path "/content/drive/MyDrive/AKAN-SPEECH-EMOTION-DATA/AUDIO/" \
     --train_jsonl "/content/drive/MyDrive/AKAN-SPEECH-EMOTION-DATA/AUDIO/ser_audio_features_wav_train.jsonl" \
     --val_jsonl "/content/drive/MyDrive/AKAN-SPEECH-EMOTION-DATA/AUDIO/ser_audio_features_wav_val.jsonl" \
     --test_jsonl "/content/drive/MyDrive/AKAN-SPEECH-EMOTION-DATA/AUDIO/ser_audio_features_wav_test.jsonl" \
     --backbone whisper \
-    --batch_size 8 \
-    --num_epochs 10
+    --batch_size 16 \
+    --vocab_size 16000 \
+    --num_epochs 100 \
+    --save_dir "checkpoints" \
+    --tokenizer_path "akan_mtl_tokenizer.model" \
+    --use_amp \
+    --use_wandb
 ```
 
 #### HPC or Local Machine
 
 ```bash
-python sample_code/train_mtl.py \
+python -m sample_code.scripts.train \
     --audio_base_path "/path/to/your/audio/files/" \
     --train_jsonl "/path/to/train.jsonl" \
     --val_jsonl "/path/to/val.jsonl" \
     --test_jsonl "/path/to/test.jsonl" \
     --backbone whisper \
-    --batch_size 8 \
-    --num_epochs 10
+    --batch_size 16 \
+    --vocab_size 16000 \
+    --num_epochs 100 \
+    --save_dir "checkpoints" \
+    --tokenizer_path "akan_mtl_tokenizer.model" \
+    --use_amp \
+    --use_wandb
 ```
 
 ## Output
@@ -191,14 +199,14 @@ The system uses SentencePiece for subword tokenization, which provides several b
 Before training the MTL model, you need to train the SentencePiece tokenizer:
 
 ```python
-from sample_code.train_mtl import setup_tokenizer_and_dataset
+from sample_code.scripts.tokenizer import SentencePieceTokenizer
 
 # Train new tokenizer
-tokenizer = setup_tokenizer_and_dataset(
-    dataset_dict=your_dataset,
-    vocab_size=4000,  # Adjust based on your needs
-    model_prefix='whisper_mtl_tokenizer'
+tokenizer = SentencePieceTokenizer(
+    vocab_size=16000,  # Adjust based on your needs
+    model_prefix='akan_mtl_tokenizer'
 )
+tokenizer.train_tokenizer(text_data=your_text_data)
 ```
 
 This will:
@@ -212,12 +220,12 @@ This will:
 For subsequent training runs, you can use an existing tokenizer:
 
 ```python
-from sample_code.tokenizer import SentencePieceTokenizer
+from sample_code.scripts.tokenizer import SentencePieceTokenizer
 
 # Load existing tokenizer
 tokenizer = SentencePieceTokenizer(
     model_path='path/to/tokenizer.model',
-    vocab_size=4000  # Should match the trained tokenizer
+    vocab_size=16000  # Should match the trained tokenizer
 )
 tokenizer.load_tokenizer()
 ```
@@ -232,38 +240,12 @@ The SentencePiece tokenizer includes special tokens:
 - `bos_id`: 3 (Beginning of sequence)
 - `eos_id`: 4 (End of sequence)
 
-### Tokenizer Usage in Training
-
-When running the training script, you can specify whether to use an existing tokenizer:
-
-```bash
-# First time training (train new tokenizer)
-python sample_code/train_mtl.py \
-    --audio_base_path "/path/to/audio/files/" \
-    --train_jsonl "/path/to/train.jsonl" \
-    --val_jsonl "/path/to/val.jsonl" \
-    --test_jsonl "/path/to/test.jsonl" \
-    --backbone whisper \
-    --vocab_size 4000 \
-    --retrain_tokenizer  # This flag will train a new tokenizer
-
-# Subsequent training (use existing tokenizer)
-python sample_code/train_mtl.py \
-    --audio_base_path "/path/to/audio/files/" \
-    --train_jsonl "/path/to/train.jsonl" \
-    --val_jsonl "/path/to/val.jsonl" \
-    --test_jsonl "/path/to/test.jsonl" \
-    --backbone whisper \
-    --vocab_size 4000 \
-    --tokenizer_path "path/to/tokenizer.model"  # Use existing tokenizer
-```
-
 ### Tokenizer Best Practices
 
 1. **Vocabulary Size**:
 
    - Start with a smaller vocabulary (e.g., 1000-2000) for initial testing
-   - Increase to 4000-8000 for production use
+   - Increase to 8000-16000 for production use
    - Consider your language's characteristics when choosing size
 2. **Training Data**:
 

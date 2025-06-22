@@ -1,5 +1,5 @@
 """
-Paper-Style Training Script for MTL Model
+Training Script for MTL Model
 Following "Speech Emotion Recognition with Multi-task Learning" methodology
 """
 
@@ -35,18 +35,18 @@ torch.serialization.add_safe_globals([MTLConfig])
 
 
 def parse_arguments():
-    """Parse command line arguments following paper's experimental setup"""
+    """Parse command line arguments following experimental setup"""
     parser = argparse.ArgumentParser(
-        description="Paper-Style MTL Training for Speech Emotion Recognition")
+        description="MTL Training for Speech Emotion Recognition")
 
     # Model configuration
     parser.add_argument("--backbone", type=str, default="whisper",
                         choices=list(BACKBONE_CONFIGS.keys()),
-                        help="Backbone model (paper used wav2vec-2.0)")
+                        help="Backbone model (whisper, mms, xlsr, wav2vec2-bert)")
     parser.add_argument("--vocab_size", type=int, default=4000,
                         help="Vocabulary size for tokenizer")
 
-    # Paper-style alpha configuration
+    # alpha configuration
     parser.add_argument("--alpha_asr", type=float, default=0.1,
                         help="Alpha weight for ASR auxiliary task (paper optimal: 0.1)")
     parser.add_argument("--alpha_prosody", type=float, default=0.1,
@@ -55,8 +55,8 @@ def parse_arguments():
     # Enhanced CTC regularization parameters (NEW)
     parser.add_argument("--ctc_entropy_weight", type=float, default=0.01,
                         help="Entropy regularization weight for CTC loss")
-    parser.add_argument("--ctc_blank_penalty", type=float, default=0.1,
-                        help="Blank penalty weight for CTC loss")
+    parser.add_argument("--ctc_blank_penalty", type=float, default=50.0,
+                        help="Blank penalty weight for CTC loss (very strong penalty: 50.0)")
     parser.add_argument("--ctc_blank_threshold", type=float, default=0.3,
                         help="Threshold for blank penalty (default: 0.3, much better than 0.8)")
     parser.add_argument("--ctc_label_smoothing", type=float, default=0.0,
@@ -93,7 +93,7 @@ def parse_arguments():
     parser.add_argument("--gradient_checkpointing", action="store_true",
                         help="Enable gradient checkpointing for memory efficiency")
 
-    # Paper-style learning rates
+    # learning rates
     parser.add_argument("--backbone_lr", type=float, default=1e-5,
                         help="Learning rate for backbone (fine-tuning)")
     parser.add_argument("--head_lr", type=float, default=5e-5,
@@ -102,7 +102,7 @@ def parse_arguments():
                         help="Warmup ratio for learning rate schedule")
 
     # Training options
-    parser.add_argument("--save_dir", type=str, default="paper_style_checkpoints",
+    parser.add_argument("--save_dir", type=str, default="checkpoints",
                         help="Directory to save checkpoints")
     parser.add_argument("--early_stopping_patience", type=int, default=10,
                         help="Patience for early stopping")
@@ -116,7 +116,7 @@ def parse_arguments():
     # Experiment tracking
     parser.add_argument("--use_wandb", action="store_true",
                         help="Use Weights & Biases for experiment tracking")
-    parser.add_argument("--wandb_project", type=str, default="paper-mtl-speech",
+    parser.add_argument("--wandb_project", type=str, default="mtl-akan-speech",
                         help="W&B project name")
     parser.add_argument("--experiment_name", type=str, default=None,
                         help="Experiment name for tracking")
@@ -141,7 +141,7 @@ def parse_arguments():
 
 
 def setup_paper_style_config(args, tokenizer):
-    """Setup configuration following paper's methodology with enhanced CTC"""
+    """Setup configuration following methodology with enhanced CTC"""
     config = MTLConfig.create_paper_config(
         backbone_name=args.backbone,
         alpha_asr=args.alpha_asr,
@@ -217,12 +217,12 @@ def log_ctc_statistics(trainer, epoch):
 
 
 def main():
-    """Main training function following paper's methodology with enhancements"""
+    """Main training function with enhancements"""
     args = parse_arguments()
 
     # Print configuration
     print("\n" + "="*60)
-    print("PAPER-STYLE MTL TRAINING WITH ENHANCED CTC")
+    print("MTL TRAINING WITH ENHANCED CTC")
     print("="*60)
     print("Following: 'Speech Emotion Recognition with Multi-task Learning'")
     print(f"Main task: SER (weight = 1.0)")
@@ -233,7 +233,8 @@ def main():
     print(f"Learning rates: Backbone={args.backbone_lr}, Heads={args.head_lr}")
     print(f"\nEnhanced CTC Regularization:")
     print(f"  Entropy weight: {args.ctc_entropy_weight}")
-    print(f"  Blank penalty: {args.ctc_blank_penalty}")
+    print(
+        f"  Blank penalty: {args.ctc_blank_penalty} (VERY strong penalty to prevent blank collapse)")
     print(
         f"  Blank threshold: {args.ctc_blank_threshold} (much better than 0.8!)")
     print(f"  Label smoothing: {args.ctc_label_smoothing}")
@@ -254,12 +255,12 @@ def main():
 
     # Initialize wandb if enabled
     if args.use_wandb:
-        experiment_name = args.experiment_name or f"paper_mtl_alpha_{args.alpha_asr}_{args.alpha_prosody}_ctc_enhanced"
+        experiment_name = args.experiment_name or f"mtl_akan_{args.alpha_asr}_{args.alpha_prosody}_ctc_enhanced"
         wandb.init(
             project=args.wandb_project,
             name=experiment_name,
             config=vars(args),
-            tags=["paper-style", "enhanced-ctc", f"alpha-{args.alpha_asr}"]
+            tags=["mtl-akan", "enhanced-ctc", f"alpha-{args.alpha_asr}"]
         )
 
     # Load datasets
@@ -281,7 +282,7 @@ def main():
         print("\nTraining new SentencePiece tokenizer...")
         tokenizer = setup_tokenizer_and_dataset(
             dataset_dict, vocab_size=args.vocab_size)
-        tokenizer_save_path = os.path.join(args.save_dir, "tokenizer.model")
+        tokenizer_save_path = os.path.join(args.save_dir, "akan_mtl_tokenizer.model")
         os.makedirs(args.save_dir, exist_ok=True)
         # Save tokenizer for future use
         import shutil
@@ -341,7 +342,7 @@ def main():
 
     print_memory_usage("After data loader creation:")
 
-    # Create paper-style trainer with enhancements
+    # Create trainer with enhancements
     trainer = MTLTrainer(
         model=model,
         device=device,
@@ -350,7 +351,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps
     )
 
-    print("\nPaper-style trainer created with enhanced CTC loss")
+    print("\nTrainer created with enhanced CTC loss")
 
     # Run ablation study if requested
     if args.run_ablation_study:
@@ -388,7 +389,7 @@ def main():
     print(
         f"CTC regularization: entropy={config.ctc_entropy_weight}, blank_penalty={config.ctc_blank_penalty}, threshold={config.ctc_blank_threshold}")
 
-    # Train with paper-style approach
+    # Train with new approach
     trainer.train_paper_style(
         train_loader=train_loader,
         val_loader=val_loader,

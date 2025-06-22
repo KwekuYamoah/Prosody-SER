@@ -12,28 +12,22 @@ class SentencePieceTokenizer:
         self.sp = None
 
         # special token IDs for CTC
-        self.pad_id = 0
-        self.unk_id = 1
-        self.bos_id = 2    # Beginning of sequence
-        self.eos_id = 3    # End of Sequence
-        # CRITICAL FIX: blank_id should be set after loading the model
+        self.pad_id = 3
+        
         # as it will be the last token in the vocabulary
         self.blank_id = None
 
-    def train_tokenizer(self, text_data_path: str, model_prefix: str = 'mtl_tokenizer'):
+    def train_tokenizer(self, text_data_path: str, model_prefix: str = 'akan_mtl_tokenizer'):
         """Train SentencePiece model on available text data"""
-        # CRITICAL FIX: Don't add <blank> as user_defined_symbol
-        # CTC blank should be implicit (ID 0 or last ID)
+        # FIX: Add explicit user_defined_symbols for CTC compatibility
+        # This ensures special tokens are properly reserved in the vocabulary
         spm.SentencePieceTrainer.train(
             input=text_data_path,
             model_prefix=model_prefix,
             vocab_size=self.vocab_size,
             model_type='bpe',
             pad_id=self.pad_id,
-            unk_id=self.unk_id,
-            bos_id=self.bos_id,
-            eos_id=self.eos_id,
-            # Remove the user_defined_symbols for blank
+            user_defined_symbols=['<pad>', '<blank>'],
             character_coverage=0.995,
             normalization_rule_name='identity'  # don't normalize
         )
@@ -45,21 +39,39 @@ class SentencePieceTokenizer:
         """Loading existing SentencePiece model"""
         if self.model_path and Path(self.model_path).exists():
             self.sp = spm.SentencePieceProcessor(model_file=self.model_path)
-            # CRITICAL FIX: Set blank_id to 0 (standard CTC convention)
-            # This ensures CTC loss uses the correct blank token
-            self.blank_id = 0
+
+            # FIX: Properly set blank_id and verify special token mappings
+            vocab = self.get_vocab()
+
+            # Check if <blank> token exists in vocabulary
+            if '<blank>' in vocab:
+                self.blank_id = vocab['<blank>']
+                print(f"✓ Found <blank> token with ID: {self.blank_id}")
+            else:
+                # Fallback: use the last token ID as blank (CTC convention)
+                self.blank_id = len(vocab) - 1
+                print(
+                    f"⚠️ <blank> token not found, using last ID as blank: {self.blank_id}")
+
+            # Verify special token mappings
+            print(f"Special token mappings:")
+            print(f"  <pad>: {vocab.get('<pad>', 'NOT FOUND')}")
+            print(f"  <unk>: {vocab.get('<unk>', 'NOT FOUND')}")
+            print(f"  <s>: {vocab.get('<s>', 'NOT FOUND')}")
+            print(f"  </s>: {vocab.get('</s>', 'NOT FOUND')}")
+            print(f"  <blank>: {vocab.get('<blank>', 'NOT FOUND')}")
+
             print(
                 f"Tokenizer loaded. Vocab size: {self.get_vocab_size()}, Blank ID: {self.blank_id}")
         else:
             raise FileNotFoundError(
                 f"SentencePiece model not found at {self.model_path}")
 
-    def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+    def encode(self, text: str) -> List[int]:
         """
         Encode text to token IDs
         Args:
             text: sentence for ASR
-            add_special_tokens: Whether to add BOS/EOS tokens
         Returns:
             List of token IDs
         """
@@ -69,9 +81,6 @@ class SentencePieceTokenizer:
 
         # encode the text
         token_ids = self.sp.encode_as_ids(text)
-
-        if add_special_tokens:
-            token_ids = [self.bos_id] + token_ids + [self.eos_id]
 
         return token_ids
 
@@ -87,7 +96,7 @@ class SentencePieceTokenizer:
         if skip_special_tokens:
             # Remove blank (0), pad (0), bos, eos tokens
             filtered_ids = [id for id in token_ids if id not in [
-                self.blank_id, self.pad_id, self.bos_id, self.eos_id]]
+                self.blank_id, self.pad_id]]
         else:
             filtered_ids = token_ids
 

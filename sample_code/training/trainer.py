@@ -17,18 +17,20 @@ from sample_code.training.evaluator import MTLEvaluator
 from sample_code.training.utils import NumpyEncoder
 from sample_code.scripts.mtl_model import MTLModel
 
+from sample_code.utils.visualization import plot_training_history, plot_task_metrics_comparison
+
 
 class MTLTrainer:
     """
     Paper-style trainer for MTL with proper alpha control and backbone handling.
-    
+
     Key features:
     - Paper-style optimizer with differential learning rates
     - Enhanced training step with AMP support
     - Alpha experimentation support
     - Proper logging following paper's methodology
     """
-    
+
     def __init__(self, model: MTLModel, device='cuda', use_wandb=False, use_amp=True, gradient_accumulation_steps=1):
         self.model = model
         self.device = device
@@ -37,7 +39,7 @@ class MTLTrainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.scaler = GradScaler(enabled=use_amp)
         self.model.to(device)
-        
+
         # Training history
         self.history = {
             'train_loss': [], 'val_loss': [], 'train_metrics': [], 'val_metrics': [],
@@ -57,7 +59,7 @@ class MTLTrainer:
         - Higher learning rate for task heads (from scratch)
         """
         param_groups = []
-        
+
         # Backbone parameters (lower LR for fine-tuning)
         backbone_params = list(self.model.backbone.parameters())
         if backbone_params:
@@ -66,36 +68,38 @@ class MTLTrainer:
                 'lr': backbone_lr,
                 'name': 'backbone'
             })
-        
+
         # Task head parameters (higher LR)
         head_params = []
         for name, module in self.model.named_children():
             if name != 'backbone':  # All non-backbone modules
                 head_params.extend(list(module.parameters()))
-        
+
         if head_params:
             param_groups.append({
                 'params': head_params,
                 'lr': head_lr,
                 'name': 'task_heads'
             })
-        
-        optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01, eps=1e-8)
-        
+
+        optimizer = torch.optim.AdamW(
+            param_groups, weight_decay=0.01, eps=1e-8)
+
         print(f"Paper-style optimizer created:")
         print(f"  Backbone LR: {backbone_lr}")
         print(f"  Task heads LR: {head_lr}")
         print(f"  Parameter groups: {len(param_groups)}")
-        
+
         return optimizer
 
     def train_step(self, batch):
         """Single training step following paper's methodology"""
         self.model.train()
-        
+
         # Move batch to device
         input_features = batch['input_features'].to(self.device)
-        asr_targets = batch['asr_targets'].to(self.device) if torch.is_tensor(batch['asr_targets']) else None
+        asr_targets = batch['asr_targets'].to(
+            self.device) if torch.is_tensor(batch['asr_targets']) else None
         asr_lengths = batch['asr_lengths'].to(self.device)
         prosody_targets = batch['prosody_targets'].to(self.device)
         emotion_targets = batch['emotion_targets'].to(self.device)
@@ -137,7 +141,8 @@ class MTLTrainer:
             outputs = self.train_step(batch)
 
             # Scale loss by accumulation steps
-            total_loss = outputs['total_loss'] / self.gradient_accumulation_steps
+            total_loss = outputs['total_loss'] / \
+                self.gradient_accumulation_steps
 
             # Backward pass
             if self.use_amp:
@@ -151,13 +156,15 @@ class MTLTrainer:
                     # Unscale gradients before clipping
                     self.scaler.unscale_(optimizer)
                     # Clip gradients to prevent exploding gradients
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_norm=1.0)
                     # Step optimizer
                     self.scaler.step(optimizer)
                     self.scaler.update()
                 else:
                     # Clip gradients
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_norm=1.0)
                     optimizer.step()
 
                 # Step scheduler if provided
@@ -168,16 +175,17 @@ class MTLTrainer:
                 optimizer.zero_grad()
 
             # Accumulate losses (multiply back to get actual loss value)
-            epoch_losses['total'] += total_loss.item() * self.gradient_accumulation_steps
+            epoch_losses['total'] += total_loss.item() * \
+                self.gradient_accumulation_steps
             if 'emotion_loss' in outputs:
                 epoch_losses['ser'] += outputs['emotion_loss'].item()
             if 'asr_loss' in outputs:
                 epoch_losses['asr'] += outputs['asr_loss'].item()
-                
+
                 # Track CTC statistics
                 if 'loss_details' in outputs and 'asr' in outputs['loss_details']:
                     ctc_stats_epoch.append(outputs['loss_details']['asr'])
-                    
+
             if 'prosody_loss' in outputs:
                 epoch_losses['prosody'] += outputs['prosody_loss'].item()
 
@@ -198,7 +206,8 @@ class MTLTrainer:
         avg_ctc_stats = {}
         if ctc_stats_epoch:
             for key in ctc_stats_epoch[0].keys():
-                avg_ctc_stats[key] = sum(stats[key] for stats in ctc_stats_epoch) / len(ctc_stats_epoch)
+                avg_ctc_stats[key] = sum(
+                    stats[key] for stats in ctc_stats_epoch) / len(ctc_stats_epoch)
             epoch_losses['ctc_stats'] = avg_ctc_stats
 
         return epoch_losses
@@ -213,7 +222,8 @@ class MTLTrainer:
             for batch_idx, batch in enumerate(data_loader):
                 # Move batch to device
                 input_features = batch['input_features'].to(self.device)
-                asr_targets = batch['asr_targets'].to(self.device) if torch.is_tensor(batch['asr_targets']) else None
+                asr_targets = batch['asr_targets'].to(
+                    self.device) if torch.is_tensor(batch['asr_targets']) else None
                 asr_lengths = batch['asr_lengths'].to(self.device)
                 prosody_targets = batch['prosody_targets'].to(self.device)
                 emotion_targets = batch['emotion_targets'].to(self.device)
@@ -261,12 +271,12 @@ class MTLTrainer:
 
         return losses
 
-    def train_paper_style(self, train_loader, val_loader, num_epochs, tokenizer, 
-                         backbone_lr=1e-5, head_lr=5e-5, save_dir='checkpoints',
-                         early_stopping_patience=10, checkpoint_interval=5):
+    def train_paper_style(self, train_loader, val_loader, num_epochs, tokenizer,
+                          backbone_lr=1e-5, head_lr=5e-5, save_dir='checkpoints',
+                          early_stopping_patience=10, checkpoint_interval=5):
         """
         Complete training loop following paper's methodology.
-        
+
         Args:
             train_loader: Training data loader
             val_loader: Validation data loader
@@ -288,14 +298,15 @@ class MTLTrainer:
         print(f"PAPER-STYLE MTL TRAINING")
         print(f"{'='*60}")
         print(f"Main task: SER (weight = 1.0)")
-        print(f"Auxiliary tasks: ASR (α = {self.model.config.alpha_asr}), Prosody (α = {self.model.config.alpha_prosody})")
+        print(
+            f"Auxiliary tasks: ASR (α = {self.model.config.alpha_asr}), Prosody (α = {self.model.config.alpha_prosody})")
         print(f"Loss formula: L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody")
         print(f"Total epochs: {num_epochs}")
         print(f"Backbone LR: {backbone_lr}, Head LR: {head_lr}")
 
         # Create paper-style optimizer
         optimizer = self.create_paper_style_optimizer(backbone_lr, head_lr)
-        
+
         # Create scheduler
         scheduler = ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=5, verbose=True, min_lr=1e-7
@@ -314,8 +325,19 @@ class MTLTrainer:
                 print(f"\nCTC Statistics:")
                 ctc_stats = train_losses['ctc_stats']
                 print(f"  CTC Loss: {ctc_stats.get('ctc_loss', 0):.4f}")
-                print(f"  Entropy Loss: {ctc_stats.get('entropy_loss', 0):.4f}")
-                print(f"  Blank Penalty: {ctc_stats.get('blank_penalty', 0):.4f}")
+                print(
+                    f"  Entropy Loss: {ctc_stats.get('entropy_loss', 0):.4f}")
+                print(
+                    f"  Blank Penalty: {ctc_stats.get('blank_penalty', 0):.4f}")
+                print(f"  More Info:")
+                print(
+                    f"    Avg Blank Prob: {ctc_stats.get('avg_blank_prob', 0):.4f}")
+                print(
+                    f"    Blank Threshold: {ctc_stats.get('blank_threshold', 0):.4f}")
+                print(
+                    f"    Blank Penalty Weight: {ctc_stats.get('blank_penalty_weight', 0):.4f}")
+                print(
+                    f"    Entropy Weight: {ctc_stats.get('entropy_weight', 0):.4f}")
 
             # Validation
             evaluator = MTLEvaluator(
@@ -331,23 +353,24 @@ class MTLTrainer:
             print(f"\nEpoch {epoch + 1} Results:")
             print(f"  Train Loss: {train_losses['total']:.4f}")
             print(f"    SER: {train_losses['ser']:.4f} (main task)")
-            print(f"    ASR: {train_losses['asr']:.4f} (α={self.model.config.alpha_asr})")
-            print(f"    Prosody: {train_losses['prosody']:.4f} (α={self.model.config.alpha_prosody})")
+            print(
+                f"    ASR: {train_losses['asr']:.4f} (α={self.model.config.alpha_asr})")
+            print(
+                f"    Prosody: {train_losses['prosody']:.4f} (α={self.model.config.alpha_prosody})")
             print(f"  Val Loss: {val_losses['total']:.4f}")
-            
+
             # Print validation metrics
             ser_accuracy = 0.0
             evaluator.print_detailed_results(val_metrics)
+
             
-            # Extract SER accuracy for best model tracking
-            if 'emotion' in val_metrics and 'accuracy' in val_metrics['emotion']:
-                ser_accuracy = val_metrics['emotion']['accuracy']
 
             # Update history
             self.history['train_loss'].append(train_losses)
             self.history['val_loss'].append(val_losses)
             self.history['val_metrics'].append(val_metrics)
-            self.history['alpha_history'].append(self.model.config.get_alpha_values())
+            self.history['alpha_history'].append(
+                self.model.config.get_alpha_values())
 
             # Log to wandb if enabled
             if self.use_wandb:
@@ -361,7 +384,7 @@ class MTLTrainer:
                     },
                     epoch, 'train'
                 )
-                
+
                 wandb.log({
                     'epoch': epoch,
                     'train_total_loss': train_losses['total'],
@@ -371,28 +394,32 @@ class MTLTrainer:
                     'alpha_prosody': self.model.config.alpha_prosody
                 })
 
-            # Check for best model (prioritize SER accuracy as main task)
-            if ser_accuracy > best_ser_accuracy:
-                best_ser_accuracy = ser_accuracy
+            # Check for best model (prioritize validation loss for the whole task)
+            if val_losses['total'] < best_val_loss:
+                best_val_loss = val_losses['total']
                 best_epoch = epoch
                 patience_counter = 0
                 self.save_checkpoint(
                     os.path.join(save_dir, 'best_model.pt'),
                     epoch, optimizer, scheduler, is_best=True
                 )
-                print(f"\n🎯 New best SER accuracy: {best_ser_accuracy:.4f} (saved)")
+                print(
+                    f"\n New best MTL Model: {best_val_loss:.4f} (saved)")
             else:
                 patience_counter += 1
 
             # Periodic checkpoints
             if (epoch + 1) % checkpoint_interval == 0:
-                checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pt')
-                self.save_checkpoint(checkpoint_path, epoch, optimizer, scheduler)
-                print(f"💾 Checkpoint saved at epoch {epoch+1}")
+                checkpoint_path = os.path.join(
+                    save_dir, f'checkpoint_epoch_{epoch+1}.pt')
+                self.save_checkpoint(
+                    checkpoint_path, epoch, optimizer, scheduler)
+                print(f"Checkpoint saved at epoch {epoch+1}")
 
             # Early stopping
             if patience_counter >= early_stopping_patience:
-                print(f"\n⏹️ Early stopping triggered after {epoch + 1} epochs")
+                print(
+                    f"\n Early stopping triggered after {epoch + 1} epochs")
                 break
 
         # Copy best model to final
@@ -401,49 +428,58 @@ class MTLTrainer:
         if os.path.exists(best_path):
             import shutil
             shutil.copy2(best_path, final_path)
-            print(f"\n✅ Best model (epoch {best_epoch + 1}) copied to final_model.pt")
+            print(
+                f"\n✅ Best model (epoch {best_epoch + 1}) copied to final_model.pt")
 
         # Save training history
         self.save_history(os.path.join(save_dir, 'training_history.json'))
 
-        print(f"\n🎉 Paper-style training completed!")
-        print(f"Best SER accuracy: {best_ser_accuracy:.4f} at epoch {best_epoch + 1}")
+        print(f"\n🎉 Training completed!")
+        print(
+            f"Best MTL Model with Val Loss: {best_val_loss:.4f} at epoch {best_epoch + 1}")
+        
+        # Plot training history
+        plot_training_history(self.history, os.path.join(save_dir, 'training_history.png'))
+        # Plot task metrics comparison
+        plot_task_metrics_comparison(self.history, os.path.join(save_dir, 'task_metrics_comparison.png'))
 
-    def run_paper_ablation_study(self, train_loader, val_loader, tokenizer, 
-                                alpha_values=[0.0, 0.001, 0.01, 0.1, 1.0],
-                                epochs_per_alpha=5, save_dir='ablation_results'):
+    def run_paper_ablation_study(self, train_loader, val_loader, tokenizer,
+                                 alpha_values=[0.0, 0.001, 0.01, 0.1, 1.0],
+                                 epochs_per_alpha=5, save_dir='ablation_results'):
         """
         Run ablation study following paper's methodology.
         Tests different alpha values to find optimal auxiliary task contribution.
         """
         print(f"\n{'='*60}")
-        print(f"PAPER-STYLE ABLATION STUDY")
+        print(f"ABLATION STUDY")
         print(f"{'='*60}")
         print(f"Testing alpha values: {alpha_values}")
         print(f"Epochs per alpha: {epochs_per_alpha}")
-        
+
         os.makedirs(save_dir, exist_ok=True)
         ablation_results = {}
-        
+
         for alpha in alpha_values:
             print(f"\n--- Testing Alpha = {alpha} ---")
-            
+
             # Update model's alpha values
-            self.model.update_alpha_values(alpha, alpha)  # Same alpha for both auxiliary tasks
-            
+            # Same alpha for both auxiliary tasks
+            self.model.update_alpha_values(alpha, alpha)
+
             # Create optimizer for this alpha configuration
-            optimizer = self.create_paper_style_optimizer(backbone_lr=1e-5, head_lr=5e-5)
-            
+            optimizer = self.create_paper_style_optimizer(
+                backbone_lr=1e-5, head_lr=5e-5)
+
             # Reset model state for fair comparison
             # Note: In practice, you might want to start from a pre-trained checkpoint
-            
+
             best_ser_acc = 0.0
             alpha_losses = []
-            
+
             for epoch in range(epochs_per_alpha):
                 # Training
                 train_losses = self.train_epoch(train_loader, optimizer)
-                
+
                 # Quick evaluation
                 self.model.eval()
                 with torch.no_grad():
@@ -451,55 +487,59 @@ class MTLTrainer:
                         self.model, tokenizer, self.device, self.use_amp, decode_method='greedy'
                     )
                     val_metrics = evaluator.evaluate(val_loader)
-                    ser_acc = val_metrics.get('emotion', {}).get('accuracy', 0.0)
-                    
+                    ser_acc = val_metrics.get(
+                        'emotion', {}).get('accuracy', 0.0)
+
                     if ser_acc > best_ser_acc:
                         best_ser_acc = ser_acc
-                    
+
                     alpha_losses.append(train_losses['total'])
-                
-                print(f"  Epoch {epoch+1}: SER Acc = {ser_acc:.4f}, Loss = {train_losses['total']:.4f}")
-            
+
+                print(
+                    f"  Epoch {epoch+1}: SER Acc = {ser_acc:.4f}, Loss = {train_losses['total']:.4f}")
+
             ablation_results[alpha] = {
                 'best_ser_accuracy': best_ser_acc,
                 'final_ser_accuracy': ser_acc,
                 'avg_loss': sum(alpha_losses) / len(alpha_losses),
                 'loss_history': alpha_losses
             }
-            
+
             print(f"Alpha {alpha} -> Best SER Accuracy: {best_ser_acc:.4f}")
-            
+
             # Log to wandb if enabled
             if self.use_wandb:
                 wandb.log({
                     f'ablation_alpha_{alpha}_best_accuracy': best_ser_acc,
                     f'ablation_alpha_{alpha}_avg_loss': ablation_results[alpha]['avg_loss']
                 })
-        
+
         # Find optimal alpha
-        best_alpha = max(ablation_results.keys(), 
-                        key=lambda a: ablation_results[a]['best_ser_accuracy'])
-        
+        best_alpha = max(ablation_results.keys(),
+                         key=lambda a: ablation_results[a]['best_ser_accuracy'])
+
         print(f"\n🎯 ABLATION STUDY RESULTS:")
         print(f"{'Alpha':<8} {'Best Acc':<10} {'Avg Loss':<10}")
         print("-" * 30)
         for alpha in alpha_values:
             results = ablation_results[alpha]
             marker = " <- BEST" if alpha == best_alpha else ""
-            print(f"{alpha:<8} {results['best_ser_accuracy']:<10.4f} {results['avg_loss']:<10.4f}{marker}")
-        
+            print(
+                f"{alpha:<8} {results['best_ser_accuracy']:<10.4f} {results['avg_loss']:<10.4f}{marker}")
+
         print(f"\n🏆 Optimal Alpha: {best_alpha}")
-        print(f"   Best SER Accuracy: {ablation_results[best_alpha]['best_ser_accuracy']:.4f}")
+        print(
+            f"   Best SER Accuracy: {ablation_results[best_alpha]['best_ser_accuracy']:.4f}")
         print(f"   Paper's optimal: 0.1 (for comparison)")
-        
+
         # Save ablation results
         ablation_path = os.path.join(save_dir, 'ablation_results.json')
         with open(ablation_path, 'w') as f:
             json.dump(ablation_results, f, indent=4)
-        
+
         # Set model to optimal alpha
         self.model.update_alpha_values(best_alpha, best_alpha)
-        
+
         return ablation_results, best_alpha
 
     def log_paper_style_metrics(self, outputs, epoch, mode='train'):
@@ -509,7 +549,7 @@ class MTLTrainer:
                 f'{mode}_total_loss': outputs['total_loss'].item(),
                 'epoch': epoch
             }
-            
+
             # Individual task losses
             if 'emotion_loss' in outputs:
                 log_dict[f'{mode}_ser_loss'] = outputs['emotion_loss'].item()
@@ -517,18 +557,18 @@ class MTLTrainer:
                 log_dict[f'{mode}_asr_loss'] = outputs['asr_loss'].item()
             if 'prosody_loss' in outputs:
                 log_dict[f'{mode}_prosody_loss'] = outputs['prosody_loss'].item()
-            
+
             # Alpha values
             if 'alpha_values' in outputs:
                 for key, value in outputs['alpha_values'].items():
                     log_dict[f'alpha_{key}'] = value
-            
+
             # CTC regularization details
             if 'loss_details' in outputs and 'asr' in outputs['loss_details']:
                 asr_details = outputs['loss_details']['asr']
                 for key, value in asr_details.items():
                     log_dict[f'asr_{key}'] = value
-            
+
             wandb.log(log_dict)
 
     def save_checkpoint(self, path, epoch, optimizer, scheduler=None, is_best=False):
@@ -559,7 +599,8 @@ class MTLTrainer:
             checkpoint = torch.load(path, map_location=self.device)
         except Exception as e:
             if "weights_only" in str(e):
-                checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+                checkpoint = torch.load(
+                    path, map_location=self.device, weights_only=False)
             else:
                 raise e
 
@@ -593,7 +634,8 @@ class MTLTrainer:
     def save_history(self, path):
         """Save training history"""
         with open(path, 'w', encoding='utf-8') as f:
-            json.dump(self.history, f, indent=4, ensure_ascii=False, cls=NumpyEncoder)
+            json.dump(self.history, f, indent=4,
+                      ensure_ascii=False, cls=NumpyEncoder)
 
     def get_training_summary(self):
         """Get summary of training configuration and results"""

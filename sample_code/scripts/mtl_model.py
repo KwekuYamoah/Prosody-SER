@@ -113,14 +113,18 @@ class MTLModel(nn.Module):
 
         # ASR loss (auxiliary task) with enhanced CTC to fix blank prediction
         if self.use_asr:
+            # Get the correct blank ID from tokenizer
+            blank_id = self.tokenizer.blank_id if self.tokenizer else 0
+
             self.asr_loss = CTCLoss(
-                blank_id=0,  # Standard CTC blank
+                blank_id=blank_id,  # Use tokenizer's blank ID
                 zero_infinity=True,
                 entropy_weight=self.config.ctc_entropy_weight,
                 blank_penalty=self.config.ctc_blank_penalty,
                 blank_threshold=self.config.ctc_blank_threshold
             )
             print(f"ASR CTC Loss initialized with regularization:")
+            print(f"  Blank ID: {blank_id}")
             print(f"  Entropy weight: {self.config.ctc_entropy_weight}")
             print(f"  Blank penalty: {self.config.ctc_blank_penalty}")
             print(f"  Blank threshold: {self.config.ctc_blank_threshold}")

@@ -74,7 +74,7 @@ def collate_fn_mtl(batch: List[Dict], pad_token_id: int = 0, tokenizer=None, bac
     if tokenizer:
         tokenized_ids = [
             torch.tensor(tokenizer.encode(
-                " ".join(item['asr_target']), add_special_tokens=True), dtype=torch.long)
+                " ".join(item['asr_target'])), dtype=torch.long)
             for item in batch
         ]
         asr_targets = torch.nn.utils.rnn.pad_sequence(

@@ -206,6 +206,7 @@ class CTCLoss(torch.nn.Module):
         blank_penalty_loss = torch.tensor(0.0, device=log_probs.device)
         if self.blank_penalty > 0:
             blank_probs = probs[:, :, self.blank_id]  # (T, N)
+            
             # Mask by actual lengths
             length_mask = torch.arange(log_probs.size(
                 0), device=log_probs.device).unsqueeze(1) < input_lengths.unsqueeze(0)
@@ -217,17 +218,19 @@ class CTCLoss(torch.nn.Module):
 
             # Progressive penalty: stronger penalty as blank probability increases
             if avg_blank_prob > self.blank_threshold:
-                # Quadratic penalty for excessive blanks
+                # Much stronger quadratic penalty for excessive blanks
                 excess_ratio = (
                     avg_blank_prob - self.blank_threshold) / (1.0 - self.blank_threshold)
-                blank_penalty_loss = (excess_ratio ** 2) * 5.0
+                # Increased from 5.0 to 100.0
+                blank_penalty_loss = (excess_ratio ** 2) * 100.0
 
                 # Additional penalty for individual timesteps with high blank probability
                 high_blank_mask = masked_blank_probs > 0.5  # Penalize individual timesteps > 50%
                 if high_blank_mask.any():
                     individual_penalty = torch.mean(
                         masked_blank_probs[high_blank_mask] ** 2)
-                    blank_penalty_loss += individual_penalty * 2.0
+                    blank_penalty_loss += individual_penalty * 50.0  # Increased from 2.0 to 50.0
+
 
         # 3. Label smoothing (optional - smooths the target distribution)
         label_smoothing_loss = torch.tensor(0.0, device=log_probs.device)
@@ -267,7 +270,12 @@ class CTCLoss(torch.nn.Module):
             'blank_penalty': blank_penalty_loss.item(),
             'label_smoothing_loss': label_smoothing_loss.item(),
             'confidence_penalty': confidence_penalty_loss.item(),
-            'total_regularization': (total_loss - ctc_loss).item()
+            'total_regularization': (total_loss - ctc_loss).item(),
+            # Debug information
+            'avg_blank_prob': torch.mean(probs[:, :, self.blank_id]).item(),
+            'blank_threshold': self.blank_threshold,
+            'blank_penalty_weight': self.blank_penalty,
+            'entropy_weight': self.entropy_weight
         }
 
         return total_loss, loss_details
