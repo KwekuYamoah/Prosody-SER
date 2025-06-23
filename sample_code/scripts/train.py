@@ -475,9 +475,9 @@ def main():
     }
 
     # Save results
-    results_path = os.path.join(args.save_dir, 'final_results.json')
+    results_path = os.path.join(args.save_dir, args.backbone+'_final_results.json')
     with open(results_path, 'w') as f:
-        json.dump(final_results, f, indent=4, cls=NumpyEncoder)
+        json.dump(final_results, f, indent=4, cls=NumpyEncoder, ensure_ascii=False)
 
     print(f"\n✅ Training completed successfully!")
     print(f"Results saved to: {args.save_dir}")

@@ -400,7 +400,7 @@ class MTLTrainer:
                 best_epoch = epoch
                 patience_counter = 0
                 self.save_checkpoint(
-                    os.path.join(save_dir, 'best_model.pt'),
+                    os.path.join(save_dir, self.model.config.backbone_name+'_best_model.pt'),
                     epoch, optimizer, scheduler, is_best=True
                 )
                 print(
@@ -411,7 +411,7 @@ class MTLTrainer:
             # Periodic checkpoints
             if (epoch + 1) % checkpoint_interval == 0:
                 checkpoint_path = os.path.join(
-                    save_dir, f'checkpoint_epoch_{epoch+1}.pt')
+                    save_dir, f'{self.model.config.backbone_name}_checkpoint_epoch_{epoch+1}.pt')
                 self.save_checkpoint(
                     checkpoint_path, epoch, optimizer, scheduler)
                 print(f"Checkpoint saved at epoch {epoch+1}")
@@ -423,8 +423,8 @@ class MTLTrainer:
                 break
 
         # Copy best model to final
-        best_path = os.path.join(save_dir, 'best_model.pt')
-        final_path = os.path.join(save_dir, 'final_model.pt')
+        best_path = os.path.join(save_dir, self.model.config.backbone_name+'_best_model.pt')
+        final_path = os.path.join(save_dir, self.model.config.backbone_name+'_final_model.pt')
         if os.path.exists(best_path):
             import shutil
             shutil.copy2(best_path, final_path)
@@ -432,16 +432,16 @@ class MTLTrainer:
                 f"\n✅ Best model (epoch {best_epoch + 1}) copied to final_model.pt")
 
         # Save training history
-        self.save_history(os.path.join(save_dir, 'training_history.json'))
+        self.save_history(os.path.join(save_dir, self.model.config.backbone_name+'_training_history.json'))
 
         print(f"\n🎉 Training completed!")
         print(
             f"Best MTL Model with Val Loss: {best_val_loss:.4f} at epoch {best_epoch + 1}")
         
         # Plot training history
-        plot_training_history(self.history, os.path.join(save_dir, 'training_history.png'))
+        plot_training_history(self.history, os.path.join(save_dir, self.model.config.backbone_name+'_training_history.png'))
         # Plot task metrics comparison
-        plot_task_metrics_comparison(self.history, os.path.join(save_dir, 'task_metrics_comparison.png'))
+        plot_task_metrics_comparison(self.history, os.path.join(save_dir, self.model.config.backbone_name+'_task_metrics_comparison.png'))
 
     def run_paper_ablation_study(self, train_loader, val_loader, tokenizer,
                                  alpha_values=[0.0, 0.001, 0.01, 0.1, 1.0],
