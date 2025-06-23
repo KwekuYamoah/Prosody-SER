@@ -28,6 +28,7 @@ def collate_fn_mtl(batch: List[Dict], pad_token_id: int = 0, tokenizer=None, bac
     Properly handles different backbone input shapes by finding
     the max size of all dimensions in the batch.
     """
+    
     batch_size = len(batch)
 
     # Handle input features based on backbone type

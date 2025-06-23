@@ -11,7 +11,7 @@ class MTLConfig:
     Following "Speech Emotion Recognition with Multi-task Learning" paper:
     - SER is the main task (weight = 1.0)
     - ASR and Prosody are auxiliary tasks (weighted by alpha values)
-    - Loss formula: L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody
+    - Loss formula: L = α_SER * L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody
     """
     backbone_name: str = "whisper"
     vocab_size: int = 51865
@@ -21,6 +21,7 @@ class MTLConfig:
     final_dropout: float = 0.1
 
     # alpha control (key innovation)
+    alpha_ser: float = 1.0          # main task (SER) weight
     alpha_asr: float = 0.1          # optimal value for ASR auxiliary task
     alpha_prosody: float = 0.1      # optimal value for Prosody auxiliary task
 
@@ -50,6 +51,8 @@ class MTLConfig:
             raise ValueError("alpha_asr must be between 0.0 and 1.0")
         if not 0.0 <= self.alpha_prosody <= 1.0:
             raise ValueError("alpha_prosody must be between 0.0 and 1.0")
+        if not 0.0 <= self.alpha_ser <= 1.0:
+            raise ValueError("alpha_ser must be between 0.0 and 1.0")
 
         # Validate other parameters
         if self.vocab_size <= 0:
@@ -71,7 +74,7 @@ class MTLConfig:
         # Paper-style loss weights: SER=1.0 (main), others weighted by alpha
         if self.loss_weights is None:
             self.loss_weights = {
-                'ser': 1.0,                    # Main task (always 1.0)
+                'ser': self.alpha_ser,         # Main task (mostly 1.0)
                 'asr': self.alpha_asr,         # Auxiliary task weighted by alpha
                 'prosody': self.alpha_prosody  # Auxiliary task weighted by alpha
             }
@@ -80,7 +83,7 @@ class MTLConfig:
         if self.loss_weights.get('ser', 0) != 1.0:
             print("Warning: SER should be main task with weight=1.0 (paper methodology)")
 
-    def update_alpha_weights(self, alpha_asr: float, alpha_prosody: float):
+    def update_alpha_weights(self, alpha_ser: float, alpha_asr: float, alpha_prosody: float):
         """
         Update alpha values and recalculate loss weights.
 
@@ -91,13 +94,16 @@ class MTLConfig:
             raise ValueError("alpha_asr must be between 0.0 and 1.0")
         if not 0.0 <= alpha_prosody <= 1.0:
             raise ValueError("alpha_prosody must be between 0.0 and 1.0")
+        if not 0.0 <= self.alpha_ser <= 1.0:
+            raise ValueError("alpha_ser must be between 0.0 and 1.0")
 
         self.alpha_asr = alpha_asr
         self.alpha_prosody = alpha_prosody
+        self.alpha_ser = alpha_ser
 
         # Update loss weights following paper's formula
         self.loss_weights = {
-            'ser': 1.0,                    # Main task weight (always 1.0)
+            'ser': self.alpha_ser,         # Main task weight (mostly 1.0)
             'asr': self.alpha_asr,         # α_ASR from paper
             'prosody': self.alpha_prosody  # α_Prosody from paper
         }
@@ -107,7 +113,7 @@ class MTLConfig:
         return {
             'alpha_asr': self.alpha_asr,
             'alpha_prosody': self.alpha_prosody,
-            'main_task_weight': 1.0
+            'main_task_weight': self.alpha_ser
         }
 
     def get_paper_summary(self) -> Dict[str, Any]:
@@ -116,7 +122,7 @@ class MTLConfig:
             'methodology': 'Multi-task Learning for Speech Emotion Recognition',
             'main_task': 'SER (Speech Emotion Recognition)',
             'auxiliary_tasks': ['ASR (Automatic Speech Recognition)', 'Prosody Classification'],
-            'loss_formula': 'L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody',
+            'loss_formula': 'L = α_SER * L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody',
             'backbone': {
                 'model': self.backbone_name,
                 'hidden_size': self.backbone_config.hidden_size,
@@ -165,6 +171,7 @@ class MTLConfig:
             'prosody_classes': self.prosody_classes,
             'prosody_lstm_hidden': self.prosody_lstm_hidden,
             'final_dropout': self.final_dropout,
+            'alpha_ser': self.alpha_ser,
             'alpha_asr': self.alpha_asr,
             'alpha_prosody': self.alpha_prosody,
             'ctc_entropy_weight': self.ctc_entropy_weight,
@@ -185,7 +192,7 @@ class MTLConfig:
         return cls(**config_dict)
 
     @classmethod
-    def create_paper_config(cls, backbone_name: str = "whisper",
+    def create_paper_config(cls, backbone_name: str = "whisper", alpha_ser: float = 1.0,
                             alpha_asr: float = 0.1, alpha_prosody: float = 0.1) -> 'MTLConfig':
         """
         Create configuration matching paper's optimal setup.
@@ -194,6 +201,8 @@ class MTLConfig:
         """
         return cls(
             backbone_name=backbone_name,
+            vocab_size=51865,  # Default for Whisper
+            alpha_ser=alpha_ser,
             alpha_asr=alpha_asr,
             alpha_prosody=alpha_prosody,
             ctc_entropy_weight=0.01,

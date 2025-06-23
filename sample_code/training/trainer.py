@@ -22,13 +22,13 @@ from sample_code.utils.visualization import plot_training_history, plot_task_met
 
 class MTLTrainer:
     """
-    Paper-style trainer for MTL with proper alpha control and backbone handling.
+    Trainer for MTL with proper alpha control and backbone handling.
 
     Key features:
-    - Paper-style optimizer with differential learning rates
+    - Optimizer with differential learning rates
     - Enhanced training step with AMP support
     - Alpha experimentation support
-    - Proper logging following paper's methodology
+    - Proper logging following methodology
     """
 
     def __init__(self, model: MTLModel, device='cuda', use_wandb=False, use_amp=True, gradient_accumulation_steps=1):
@@ -46,7 +46,7 @@ class MTLTrainer:
             'alpha_history': [], 'task_loss_history': []
         }
 
-        print(f"Paper-style MTL Trainer initialized:")
+        print(f"MTL Trainer initialized:")
         print(f"  Device: {device}")
         print(f"  AMP enabled: {use_amp}")
         print(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
@@ -85,7 +85,7 @@ class MTLTrainer:
         optimizer = torch.optim.AdamW(
             param_groups, weight_decay=0.01, eps=1e-8)
 
-        print(f"Paper-style optimizer created:")
+        print(f"Optimizer created:")
         print(f"  Backbone LR: {backbone_lr}")
         print(f"  Task heads LR: {head_lr}")
         print(f"  Parameter groups: {len(param_groups)}")
@@ -295,15 +295,15 @@ class MTLTrainer:
         best_epoch = 0
 
         print(f"\n{'='*60}")
-        print(f"PAPER-STYLE MTL TRAINING")
+        print(f"MTL TRAINING")
         print(f"{'='*60}")
-        print(f"Main task: SER (weight = 1.0)")
+        print(f"Main task: SER (α = {self.model.config.alpha_ser})")
         print(
             f"Auxiliary tasks: ASR (α = {self.model.config.alpha_asr}), Prosody (α = {self.model.config.alpha_prosody})")
-        print(f"Loss formula: L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody")
+        print(f"Loss formula: L = α_SER * L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody")
         print(f"Total epochs: {num_epochs}")
         print(f"Backbone LR: {backbone_lr}, Head LR: {head_lr}")
-
+        print(f"\n{'='*60}")
         # Create paper-style optimizer
         optimizer = self.create_paper_style_optimizer(backbone_lr, head_lr)
 
@@ -464,7 +464,7 @@ class MTLTrainer:
 
             # Update model's alpha values
             # Same alpha for both auxiliary tasks
-            self.model.update_alpha_values(alpha, alpha)
+            self.model.update_alpha_values(alpha, alpha, alpha)
 
             # Create optimizer for this alpha configuration
             optimizer = self.create_paper_style_optimizer(
@@ -527,7 +527,7 @@ class MTLTrainer:
             print(
                 f"{alpha:<8} {results['best_ser_accuracy']:<10.4f} {results['avg_loss']:<10.4f}{marker}")
 
-        print(f"\n🏆 Optimal Alpha: {best_alpha}")
+        print(f"\n Optimal Alpha: {best_alpha}")
         print(
             f"   Best SER Accuracy: {ablation_results[best_alpha]['best_ser_accuracy']:.4f}")
         print(f"   Paper's optimal: 0.1 (for comparison)")
@@ -625,6 +625,7 @@ class MTLTrainer:
         if 'alpha_values' in checkpoint:
             alpha_vals = checkpoint['alpha_values']
             self.model.update_alpha_values(
+                alpha_vals.get('alpha_ser', 1.0),  # Default to 1.0 for main task
                 alpha_vals.get('alpha_asr', 0.1),
                 alpha_vals.get('alpha_prosody', 0.1)
             )
@@ -648,7 +649,7 @@ class MTLTrainer:
                 'use_wandb': self.use_wandb
             },
             'current_alpha_values': self.model.config.get_alpha_values(),
-            'loss_formula': 'L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody',
+            'loss_formula': 'L = α_SER * L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody',
             'training_history_length': len(self.history['train_loss']),
             'paper_reference': 'Speech Emotion Recognition with Multi-task Learning'
         }

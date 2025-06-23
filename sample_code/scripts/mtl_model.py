@@ -1,13 +1,13 @@
 """
 MTL Model Module
-Paper-style Multi-task Learning Model following:
+Multi-task Learning Model following:
 "Speech Emotion Recognition with Multi-task Learning"
 
 Key principles:
 1. SER is the main task (weight = 1.0)
 2. ASR and Prosody are auxiliary tasks (weighted by alpha)
 3. Shared wav2vec/whisper backbone with task-specific heads
-4. Loss: L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody
+4. Loss: L = α_SER * L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody
 """
 
 import torch
@@ -46,11 +46,11 @@ class MTLModel(nn.Module):
         # Initialize task-specific heads
         self._initialize_task_heads()
 
-        # Initialize loss functions with paper-style regularization
+        # Initialize loss functions with regularization
         self._initialize_loss_functions()
 
-        print(f"Paper-style MTL Model initialized:")
-        print(f"  Main task: SER (weight=1.0)")
+        print(f"MTL Model initialized:")
+        print(f"  Main task: SER (α={config.alpha_ser})")
         print(
             f"  Auxiliary tasks: ASR (α={config.alpha_asr}), Prosody (α={config.alpha_prosody})")
         print(f"  Active heads: {self.get_active_heads()}")
@@ -142,7 +142,7 @@ class MTLModel(nn.Module):
         """
         Forward pass following paper's architecture and loss computation.
 
-        Paper's loss formula: L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody
+        Paper's loss formula: L = α_SER * L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody
         """
 
         # Shared backbone feature extraction
@@ -236,18 +236,18 @@ class MTLModel(nn.Module):
     def _compute_total_loss_paper_style(self, task_losses: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict]:
         """
         Compute total loss following paper's formula:
-        L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody
+        L = α_SER * L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody
 
         Where:
-        - SER is the main task (weight = 1.0)
+        - SER is the main task (weight = 1.0), mostly
         - ASR and Prosody are auxiliary tasks (weighted by alpha)
         """
         total_loss = torch.tensor(0.0, device=next(self.parameters()).device)
         alpha_info = self.config.get_alpha_values()
 
-        # Main task: SER (always weight = 1.0)
+        # Main task: SER (mostly weight = 1.0)
         if 'ser' in task_losses:
-            total_loss += 1.0 * task_losses['ser']
+            total_loss += self.config.alpha_ser * task_losses['ser']
 
         # Auxiliary task: ASR (weighted by α_ASR)
         if 'asr' in task_losses:
@@ -332,10 +332,10 @@ class MTLModel(nn.Module):
     def get_paper_training_info(self) -> Dict:
         """Get training information following paper's methodology"""
         return {
-            'model_type': 'Paper-Style Multi-Task Learning',
+            'model_type': 'Akan Multi-Task Learning',
             'main_task': 'SER (Speech Emotion Recognition)',
             'auxiliary_tasks': ['ASR (Automatic Speech Recognition)', 'Prosody Classification'],
-            'loss_formula': 'L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody',
+            'loss_formula': 'L = α_SER * L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody',
             'alpha_values': self.config.get_alpha_values(),
             'backbone': {
                 'model': self.config.backbone_name,
@@ -350,29 +350,29 @@ class MTLModel(nn.Module):
             }
         }
 
-    def update_alpha_values(self, alpha_asr: float, alpha_prosody: float):
+    def update_alpha_values(self, alpha_ser: float, alpha_asr: float, alpha_prosody: float):
         """Update alpha values for auxiliary tasks (useful for experiments)"""
-        self.config.update_alpha_weights(alpha_asr, alpha_prosody)
+        self.config.update_alpha_weights(alpha_ser, alpha_asr, alpha_prosody)
         print(
             f"Updated alpha values: ASR={alpha_asr}, Prosody={alpha_prosody}")
 
     def set_paper_optimal_alpha(self):
         """Set alpha values to paper's optimal configuration (α=0.1 for both)"""
-        self.update_alpha_values(0.1, 0.1)
-        print("Set to paper's optimal alpha configuration (both auxiliary tasks = 0.1)")
+        self.update_alpha_values(1.0, 0.1, 0.1)
+        print("Set to paper's optimal alpha configuration (both auxiliary tasks = 0.1) and SER = 1.0")
 
     def disable_auxiliary_tasks(self):
         """Disable auxiliary tasks (α=0) for SER-only training"""
-        self.update_alpha_values(0.0, 0.0)
+        self.update_alpha_values(1.0, 0.0, 0.0)
         print("Disabled auxiliary tasks (SER-only mode)")
 
     def enable_asr_only(self, alpha_asr: float = 0.1):
         """Enable only ASR auxiliary task"""
-        self.update_alpha_values(alpha_asr, 0.0)
+        self.update_alpha_values(0.0, alpha_asr, 0.0)
         print(f"Enabled ASR auxiliary task only (α_ASR={alpha_asr})")
 
     def enable_prosody_only(self, alpha_prosody: float = 0.1):
         """Enable only Prosody auxiliary task"""
-        self.update_alpha_values(0.0, alpha_prosody)
+        self.update_alpha_values(0.0, 0.0, alpha_prosody)
         print(
             f"Enabled Prosody auxiliary task only (α_Prosody={alpha_prosody})")

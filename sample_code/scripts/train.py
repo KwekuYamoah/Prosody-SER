@@ -31,7 +31,6 @@ from sample_code.utils import load_and_prepare_datasets, setup_tokenizer_and_dat
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # Avoid deadlocks with DataLoader
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-torch.serialization.add_safe_globals([MTLConfig])
 
 
 def parse_arguments():
@@ -47,10 +46,20 @@ def parse_arguments():
                         help="Vocabulary size for tokenizer")
 
     # alpha configuration
+    parser.add_argument("--alpha_ser", type=float, default=1.0,
+                        help="Alpha weight for SER main task (default: 1.0)")
     parser.add_argument("--alpha_asr", type=float, default=0.1,
                         help="Alpha weight for ASR auxiliary task (paper optimal: 0.1)")
     parser.add_argument("--alpha_prosody", type=float, default=0.1,
                         help="Alpha weight for Prosody auxiliary task (paper optimal: 0.1)")
+    
+    # Set Boolean flags for alpha weights
+    parser.add_argument("--use_alpha_asr", action="store_true",
+                        help="Use alpha weight for ASR task (default: True)")
+    parser.add_argument("--use_alpha_prosody", action="store_true",
+                        help="Use alpha weight for Prosody task (default: True)")
+    parser.add_argument("--use_alpha_ser", action="store_true",
+                        help="Use alpha weight for SER main task (default: True)")
 
     # Enhanced CTC regularization parameters (NEW)
     parser.add_argument("--ctc_entropy_weight", type=float, default=0.01,
@@ -144,6 +153,7 @@ def setup_paper_style_config(args, tokenizer):
     """Setup configuration following methodology with enhanced CTC"""
     config = MTLConfig.create_paper_config(
         backbone_name=args.backbone,
+        alpha_ser=args.alpha_ser,
         alpha_asr=args.alpha_asr,
         alpha_prosody=args.alpha_prosody
     )
@@ -239,6 +249,7 @@ def main():
         f"  Blank threshold: {args.ctc_blank_threshold} (much better than 0.8!)")
     print(f"  Label smoothing: {args.ctc_label_smoothing}")
     print(f"  Confidence penalty: {args.ctc_confidence_penalty}")
+    print("\n" + "="*60 + "\n")
 
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -266,7 +277,7 @@ def main():
     # Load datasets
     print("\n" + "="*60)
     print("DATA LOADING")
-    print("="*60)
+    print("="*60 + "\n")
 
     dataset_dict = load_and_prepare_datasets(
         args.train_jsonl, args.val_jsonl, args.test_jsonl, args.audio_base_path
@@ -299,19 +310,23 @@ def main():
     # Setup configuration and model
     print("\n" + "="*60)
     print("MODEL SETUP")
-    print("="*60)
+    print("="*60 + "\n")
 
     config = setup_paper_style_config(args, tokenizer)
+    print("\n" + "="*60)
     print("\nConfiguration summary:")
+    print("\n" + "="*60)
+
     summary = config.get_paper_summary()
     print(json.dumps(summary, indent=2))
+    print("\n" + "="*60)
 
     # Create paper-style model with enhanced CTC
     model = MTLModel(
         config=config,
-        use_asr=True,
-        use_prosody=True,
-        use_ser=True,
+        use_asr=args.use_alpha_asr,
+        use_prosody=args.use_alpha_prosody,
+        use_ser=args.use_alpha_ser,
         tokenizer=tokenizer
     ).to(device)
 
@@ -320,8 +335,8 @@ def main():
         model.backbone.gradient_checkpointing_enable()
         print("✓ Gradient checkpointing enabled for memory efficiency")
 
-    print(f"\nModel info:")
-    print(f"  Active heads: {model.get_active_heads()}")
+    print(f"\n More Model info:")
+    print("\n" + "="*60)
     print(
         f"  Training approach: {model.get_paper_training_info()['model_type']}")
     print(
@@ -369,7 +384,7 @@ def main():
         print(f"\nAblation study completed! Optimal alpha: {optimal_alpha}")
 
         # Update config with optimal alpha
-        config.update_alpha_weights(optimal_alpha, optimal_alpha)
+        config.update_alpha_weights(optimal_alpha, optimal_alpha, optimal_alpha)
 
         # Log ablation results to wandb
         if args.use_wandb:
@@ -385,7 +400,7 @@ def main():
     print("MAIN TRAINING")
     print("="*60)
     print(
-        f"Current alpha values: ASR={config.alpha_asr}, Prosody={config.alpha_prosody}")
+        f"Current alpha values: SER={config.alpha_ser}, ASR={config.alpha_asr}, Prosody={config.alpha_prosody}")
     print(
         f"CTC regularization: entropy={config.ctc_entropy_weight}, blank_penalty={config.ctc_blank_penalty}, threshold={config.ctc_blank_threshold}")
 
@@ -440,33 +455,32 @@ def main():
     # test_metrics = evaluator.evaluate(test_loader)
     # evaluator.print_detailed_results(test_metrics)
 
-    # # Prepare comprehensive results
-    # final_results = {
-    #     'paper_methodology': 'Speech Emotion Recognition with Multi-task Learning',
-    #     'loss_formula': 'L = L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody',
-    #     'alpha_values': config.get_alpha_values(),
-    #     'ctc_regularization': {
-    #         'entropy_weight': config.ctc_entropy_weight,
-    #         'blank_penalty': config.ctc_blank_penalty,
-    #         'label_smoothing': config.ctc_label_smoothing,
-    #         'confidence_penalty': config.ctc_confidence_penalty
-    #     },
-    #     'test_metrics': test_metrics,
-    #     'training_summary': trainer.get_training_summary(),
-    #     'config_summary': config.get_paper_summary(),
-    #     'model_stats': {
-    #         'total_params': sum(p.numel() for p in model.parameters()),
-    #         'trainable_params': sum(p.numel() for p in model.parameters() if p.requires_grad)
-    #     }
-    # }
+    # Prepare comprehensive results
+    final_results = {
+        'paper_methodology': 'Speech Emotion Recognition with Multi-task Learning',
+        'loss_formula': 'L = α_SER *L_SER + α_ASR * L_ASR + α_Prosody * L_Prosody',
+        'alpha_values': config.get_alpha_values(),
+        'ctc_regularization': {
+            'entropy_weight': config.ctc_entropy_weight,
+            'blank_penalty': config.ctc_blank_penalty,
+            'label_smoothing': config.ctc_label_smoothing,
+            'confidence_penalty': config.ctc_confidence_penalty
+        },
+        'training_summary': trainer.get_training_summary(),
+        'config_summary': config.get_paper_summary(),
+        'model_stats': {
+            'total_params': sum(p.numel() for p in model.parameters()),
+            'trainable_params': sum(p.numel() for p in model.parameters() if p.requires_grad)
+        }
+    }
 
-    # # Save results
-    # results_path = os.path.join(args.save_dir, 'final_results.json')
-    # with open(results_path, 'w') as f:
-    #     json.dump(final_results, f, indent=4, cls=NumpyEncoder)
+    # Save results
+    results_path = os.path.join(args.save_dir, 'final_results.json')
+    with open(results_path, 'w') as f:
+        json.dump(final_results, f, indent=4, cls=NumpyEncoder)
 
-    # print(f"\n✅ Training completed successfully!")
-    # print(f"Results saved to: {args.save_dir}")
+    print(f"\n✅ Training completed successfully!")
+    print(f"Results saved to: {args.save_dir}")
 
     # # Extract and display key metrics
     # ser_accuracy = test_metrics.get('emotion', {}).get('accuracy', 0.0)
@@ -479,20 +493,11 @@ def main():
     # print(f"  Prosody Accuracy (auxiliary): {prosody_accuracy:.4f}")
     # print(f"  Alpha values: ASR={config.alpha_asr}, Prosody={config.alpha_prosody}")
 
-    # # Log final results to wandb
-    # if args.use_wandb:
-    #     wandb.log({
-    #         'test/final_ser_accuracy': ser_accuracy,
-    #         'test/final_asr_wer': asr_wer,
-    #         'test/final_prosody_accuracy': prosody_accuracy
-    #     })
+    # Log final results to wandb
+    if args.use_wandb:
+        
 
-    #     # Log a summary table
-    #     wandb.run.summary['best_ser_accuracy'] = ser_accuracy
-    #     wandb.run.summary['best_asr_wer'] = asr_wer
-    #     wandb.run.summary['optimal_alpha'] = config.alpha_asr
-
-    #     wandb.finish()
+        wandb.finish()
 
     print_memory_usage("Final memory usage:")
 
