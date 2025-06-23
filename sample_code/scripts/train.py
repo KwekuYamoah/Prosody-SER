@@ -143,8 +143,6 @@ def parse_arguments():
     # Tokenizer options
     parser.add_argument("--tokenizer_path", type=str,
                         help="Path to trained tokenizer")
-    parser.add_argument("--retrain_tokenizer", action="store_true",
-                        help="Whether to retrain the tokenizer")
 
     return parser.parse_args()
 
@@ -288,21 +286,14 @@ def main():
     print(f"  Val: {len(dataset_dict['val'])} samples")
     print(f"  Test: {len(dataset_dict['test'])} samples")
 
-    # Setup tokenizer
-    if args.retrain_tokenizer or args.tokenizer_path is None:
-        print("\nTraining new SentencePiece tokenizer...")
-        tokenizer = setup_tokenizer_and_dataset(
-            dataset_dict, vocab_size=args.vocab_size)
-        tokenizer_save_path = os.path.join(args.save_dir, "akan_mtl_tokenizer.model")
-        os.makedirs(args.save_dir, exist_ok=True)
-        # Save tokenizer for future use
-        import shutil
-        shutil.copy(tokenizer.model_path, tokenizer_save_path)
-        print(f"Tokenizer saved to: {tokenizer_save_path}")
-    else:
+
+    if args.tokenizer_path:
         print(f"\nLoading existing tokenizer from {args.tokenizer_path}")
         tokenizer = SentencePieceTokenizer(model_path=args.tokenizer_path)
         tokenizer.load_tokenizer()
+    else:
+        # throw an error if no tokenizer is provided
+        raise ValueError("No tokenizer provided or trained. Please specify --tokenizer_path")
 
     print(f"Tokenizer vocabulary size: {tokenizer.get_vocab_size()}")
     print(f"Tokenizer blank ID: {tokenizer.blank_id}")

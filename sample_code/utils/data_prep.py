@@ -25,7 +25,7 @@ def prepare_text_for_training(dataset_dict, output_path):
     print(f"Saved {len(all_text)} text samples to {output_path}")
 
 
-def setup_tokenizer_and_dataset(dataset_dict, vocab_size=4000, model_prefix='akan_mtl_tokenizer'):
+def setup_tokenizer_and_dataset(dataset_dict, vocab_size=4000, model_type='bpe', model_prefix='akan_mtl_tokenizer'):
     """Complete setup function for SentencePiece tokenizer"""
     # Step 1: Prepare text data
     text_file = "training_text.txt"
@@ -33,7 +33,7 @@ def setup_tokenizer_and_dataset(dataset_dict, vocab_size=4000, model_prefix='aka
 
     # Step 2: Train tokenizer
     tokenizer = SentencePieceTokenizer(vocab_size=vocab_size)
-    tokenizer.train_tokenizer(text_file, model_prefix=model_prefix)
+    tokenizer.train_tokenizer(text_file, model_type=model_type, model_prefix=model_prefix)
 
     return tokenizer
 

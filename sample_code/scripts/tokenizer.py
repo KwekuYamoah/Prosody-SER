@@ -17,7 +17,7 @@ class SentencePieceTokenizer:
         # as it will be the last token in the vocabulary
         self.blank_id = None
 
-    def train_tokenizer(self, text_data_path: str, model_prefix: str = 'akan_mtl_tokenizer'):
+    def train_tokenizer(self, text_data_path: str, model_type: str = 'bpe', model_prefix: str = 'akan_mtl_tokenizer'):
         """Train SentencePiece model on available text data"""
         # FIX: Add explicit user_defined_symbols for CTC compatibility
         # This ensures special tokens are properly reserved in the vocabulary
@@ -25,7 +25,7 @@ class SentencePieceTokenizer:
             input=text_data_path,
             model_prefix=model_prefix,
             vocab_size=self.vocab_size,
-            model_type='bpe',
+            model_type=model_type,
             pad_id=self.pad_id,
             user_defined_symbols=['<pad>', '<blank>'],
             character_coverage=0.995,

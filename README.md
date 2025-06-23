@@ -401,9 +401,12 @@ from sample_code.scripts.tokenizer import SentencePieceTokenizer
 # Train new tokenizer
 tokenizer = SentencePieceTokenizer(
     vocab_size=16000,  # Adjust based on your needs
-    model_prefix='akan_mtl_tokenizer'
 )
-tokenizer.train_tokenizer(text_data=your_text_data)
+tokenizer.train_tokenizer(
+	text_data_path=your_text_data,
+	model_type='bpe',	# options are, bpe, unigram, char, or word. Input sentence must be pretokenized when using word type.
+	model_prefix: str = 'akan_mtl_tokenizer'
+)
 ```
 
 This will:
