@@ -249,10 +249,6 @@ python -m sample_code.scripts.train \
 - `--pin_memory`: Pin memory for faster GPU transfer (default: True)
 - `--prefetch_factor`: Number of batches to prefetch per worker (default: 2)
 
-**Tokenizer Options:**
-
-- `--retrain_tokenizer`: Whether to retrain the tokenizer
-
 **Ablation Study:**
 
 - `--run_ablation_study`: Run paper's ablation study with different alpha values

@@ -212,24 +212,17 @@ class CTCLoss(torch.nn.Module):
                 0), device=log_probs.device).unsqueeze(1) < input_lengths.unsqueeze(0)
             masked_blank_probs = blank_probs * length_mask.float()
 
+            
+            # exponentially increasing penalty for excessive blanks
+            masked_blank_probs = masked_blank_probs.exp()
+
             # Much more aggressive blank penalty strategy
             # Penalize if average blank probability exceeds reasonable threshold (e.g., 0.3)
-            avg_blank_prob = torch.mean(masked_blank_probs)
+            avg_blank_prob = masked_blank_probs.mean()
 
-            # Progressive penalty: stronger penalty as blank probability increases
-            if avg_blank_prob > self.blank_threshold:
-                # Much stronger quadratic penalty for excessive blanks
-                excess_ratio = (
-                    avg_blank_prob - self.blank_threshold) / (1.0 - self.blank_threshold)
-                # Increased from 5.0 to 100.0
-                blank_penalty_loss = (excess_ratio ** 2) * 100.0
+            # apply the penalty now
+            blank_penalty_loss = avg_blank_prob * 100
 
-                # Additional penalty for individual timesteps with high blank probability
-                high_blank_mask = masked_blank_probs > 0.5  # Penalize individual timesteps > 50%
-                if high_blank_mask.any():
-                    individual_penalty = torch.mean(
-                        masked_blank_probs[high_blank_mask] ** 2)
-                    blank_penalty_loss += individual_penalty * 50.0  # Increased from 2.0 to 50.0
 
 
         # 3. Label smoothing (optional - smooths the target distribution)
