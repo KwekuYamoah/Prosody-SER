@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils.rnn import pad_sequence
-from transformers import Wav2Vec2CTCTokenizer, Wav2Vec2FeatureExtractor, Wav2Vec2Processor, Wav2Vec2Config, Wav2Vec2Model
+from transformers import Wav2Vec2CTCTokenizer, Wav2Vec2FeatureExtractor, Wav2Vec2Processor, Wav2Vec2Config, Wav2Vec2Model, Wav2Vec2ForCTC
 from transformers import AutoProcessor, AutoModelForPreTraining
 from models import *
 import wandb
@@ -32,13 +32,24 @@ MAX_ASR_LABELS_LEN = 0
 
 
 # Load tokenizer from  vocab.json
+'''
 tokenizer = Wav2Vec2CTCTokenizer(
     vocab_file="vocab.json",  
     unk_token="[UNK]",
     pad_token="[PAD]",
-    word_delimiter_token="|",
-    blank_token="<blank>"
+    word_delimiter_token="|"
 )
+'''
+tokenizer = Wav2Vec2CTCTokenizer(
+    vocab_file="new_vocab.json",  
+    unk_token="[UNK]",
+    pad_token="[PAD]"
+)
+
+# add an explicit CTC blank that never appears in transcripts
+#tokenizer.add_tokens(["<ctc_blank>"])
+
+print(tokenizer.get_vocab())  # returns a dict {token_string: token_id}
 
 # Load the feature extractor
 feature_extractor = Wav2Vec2FeatureExtractor(
@@ -55,7 +66,6 @@ processor =  Wav2Vec2Processor(
                             tokenizer=tokenizer
                             )
 
-#model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-xls-r-300m")
 
 wandb.init(project="multitask-speech-model-xlsr", name="experiment_1")
 
@@ -254,33 +264,38 @@ def test(model_checkpoint_path, test_data, batch_size):
 
     wav2vec2_model_base_config = Wav2Vec2Config.from_pretrained("facebook/wav2vec2-xls-r-300m")
 
+    base_dict = wav2vec2_model_base_config.to_dict()
+
+    # remove any existing entries we intend to override
+    for k in ("pad_token_id", "vocab_size"):
+        base_dict.pop(k, None)
+
     # create a new custom config file
     custom_cfg = Wav2Vec2Config(
-                                    **wav2vec2_model_base_config.to_dict(),
+                                    **base_dict,
                                     pad_token_id = tokenizer.pad_token_id,    
-                                    vocab_size    = tokenizer.vocab_size     
+                                    vocab_size = tokenizer.vocab_size
                                 )
 
     #get the configuration for the xlsr model using the new custom config
-    w2v_base_model = Wav2Vec2Model.from_pretrained(
+    w2v_base_model = Wav2Vec2ForCTC.from_pretrained(
                                             "facebook/wav2vec2-xls-r-300m", 
                                             config=custom_cfg
                                         )
     #enable gradient checkpointing on the model
     w2v_base_model.gradient_checkpointing_enable()
+    #blank_id = tokenizer.convert_tokens_to_ids("<ctc_blank>")
 
     # Initialize the Model
     model = Wav2Vec2MTL(
                                 config=custom_cfg,
+                                tokenizer=tokenizer,
                                 pretrained_wav2vec_model=w2v_base_model,
                                 emotion_model_output_size=9,
-                                asr_model_output_size=tokenizer.vocab_size,
+                                asr_model_output_size=len(tokenizer),
                                 prosodic_prominence_model_output_size=MAX_PROSODY_LABELS_LEN,
                                 prosody_model_lstm_hidden_size=192
                             ).to(device)
-    
-
-   
     
 
     # load the checkpoints of the model
@@ -371,8 +386,8 @@ def test(model_checkpoint_path, test_data, batch_size):
         
         #print('true prosodic annotation: ', all_true_prosodic_annotation)
         #print('predicted prosodic annotation: ', all_pred_prosodic_annotation)
-        print('true asr: ', all_true_asr)
-        print('predicted asr: ', all_pred_asr)
+        #print('true asr: ', all_true_asr)
+        #print('predicted asr: ', all_pred_asr)
 
 
         
@@ -442,17 +457,12 @@ def train(train_data, val_data, test_data, training_date, checkpoint_id, lstm_hi
                             )
     val_loader = DataLoader(
                                 val_dataset, 
-                                batch_size=batch_size, 
+                                batch_size=1, 
                                 shuffle=False, 
                                 collate_fn=lambda batch: collate_fn(batch, MAX_PROSODY_LABELS_LEN)
                             )
 
 
-
-
-    
-
-    
     wav2vec2_model_base_config = Wav2Vec2Config.from_pretrained("facebook/wav2vec2-xls-r-300m")
 
     base_dict = wav2vec2_model_base_config.to_dict()
@@ -465,37 +475,54 @@ def train(train_data, val_data, test_data, training_date, checkpoint_id, lstm_hi
     custom_cfg = Wav2Vec2Config(
                                     **base_dict,
                                     pad_token_id = tokenizer.pad_token_id,    
-                                    vocab_size    = tokenizer.vocab_size     
+                                    vocab_size = tokenizer.vocab_size
                                 )
 
     #get the configuration for the xlsr model using the new custom config
-    model = Wav2Vec2Model.from_pretrained(
+    model = Wav2Vec2ForCTC.from_pretrained(
                                             "facebook/wav2vec2-xls-r-300m", 
                                             config=custom_cfg
                                         )
     #enable gradient checkpointing on the model
     model.gradient_checkpointing_enable()
 
+    #blank_id = tokenizer.convert_tokens_to_ids("<ctc_blank>")
+
     # Initialize the Model
     xlsr_model = Wav2Vec2MTL(
                                 config=custom_cfg,
+                                tokenizer=tokenizer,
                                 pretrained_wav2vec_model=model,
                                 emotion_model_output_size=9,
-                                asr_model_output_size=tokenizer.vocab_size,
+                                asr_model_output_size=len(tokenizer),
                                 prosodic_prominence_model_output_size=MAX_PROSODY_LABELS_LEN,
                                 prosody_model_lstm_hidden_size=lstm_hidden_size
                             ).to(device)
 
-    # Freeze the xlsr model
+    # Freeze the xlsr base model
     #xlsr_model.freeze_xlsr_params()
 
     #state of model parameters
     #model_params_frozen = True
 
+    '''
+        #modify the asr model head to decrease its bias towards just printing out the blank id all the time
+    with torch.no_grad():
+        # push <blank> bias way down so the model won't default to predicting all blanks
+        xlsr_model.asr_head.bias[blank_id] = -3.0
+    '''
 
+
+ 
     # set the optimizer
-    #optimizer = optim.Adam(xlsr_model.parameters())
-    optimizer = AdamW(xlsr_model.parameters(), lr=lr)
+    #optimizer = AdamW(xlsr_model.parameters(), lr=lr)
+    head_params      = [p for n,p in xlsr_model.named_parameters() if "asr_head" in n]
+    encoder_params   = [p for n,p in xlsr_model.named_parameters() if "asr_head" not in n]
+
+    optimizer = AdamW([
+        {"params": encoder_params, "lr": 1e-5},
+        {"params": head_params   , "lr": 5e-4},
+    ])
 
     #initialize the scaler
     scaler = GradScaler()
@@ -551,7 +578,6 @@ def train(train_data, val_data, test_data, training_date, checkpoint_id, lstm_hi
                 # clear the gradients from the previous forward pass, calculate the new gradients and take the optimization step
                 optimizer.zero_grad()
                 scaler.scale(computed_loss).backward()
-                #optimizer.step()
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -593,6 +619,8 @@ def train(train_data, val_data, test_data, training_date, checkpoint_id, lstm_hi
 
         val_loss = 0.0
 
+        val_count = 0
+
         with torch.no_grad():
             for batch_data in tqdm(val_loader, desc=f"Validation {epoch+1}/{epochs}"):
                 (
@@ -612,40 +640,56 @@ def train(train_data, val_data, test_data, training_date, checkpoint_id, lstm_hi
                 prosody_labels   = prosody_labels.to(device)
                 emotion_labels   = emotion_labels.to(device)
 
-                # perform a forward pass to the xlsr model
-                model_outputs = xlsr_model(
-                                                audio_features,
-                                                attention_mask=attention_mask,
-                                                prosodic_prominence_annotation_labels=prosody_labels,
-                                                asr_labels = asr_labels,
-                                                emotion_labels=emotion_labels,
-                                                mtl_head=['asr','prosodic_prominence_annotation','ser']
-                                            )
+                if val_count <= 50:
+                    try:
+                        # perform a forward pass to the xlsr model
+                        model_outputs = xlsr_model(
+                                                        audio_features,
+                                                        attention_mask=attention_mask,
+                                                        prosodic_prominence_annotation_labels=prosody_labels,
+                                                        asr_labels = asr_labels,
+                                                        emotion_labels=emotion_labels,
+                                                        mtl_head=['asr','prosodic_prominence_annotation','ser']
+                                                    )
+                        
+
+                        #print the asr output of the val set to check on the progress of the model
+                        #ASR PREDICTIONS
+                        all_pred_asr = []
+                        all_true_asr = []
+
+                        asr_preds = torch.argmax(model_outputs['asr_output'], dim=-1).cpu().tolist()
+                        print('asr preds: ', asr_preds)
+                        asr_targets = asr_labels.cpu().tolist()
+
+                        #convert ids to strings
+                        for pred_ids, target_ids in zip(asr_preds, asr_targets):
+                            pred_tokens = tokenizer.batch_decode([pred_ids], skip_special_tokens=False)[0]
+                            target_tokens = tokenizer.batch_decode([target_ids], skip_special_tokens=False)[0]
+                            all_pred_asr.append(pred_tokens)
+                            all_true_asr.append(target_tokens)
+                        
+                        print('all true asr: ', all_true_asr)
+                        print('all print asr: ', all_pred_asr)
+
+
+                        # compute the loss 
+                        computed_val_loss = (alpha_ctc*model_outputs['asr_loss']) + (alpha_prosody*model_outputs['prosody_loss']) + (alpha_ser*model_outputs['ser_loss'])
+                        val_loss += computed_val_loss.item()
+
+                        val_count += 1
+
+                    except RuntimeError as e:
+                        if 'out of memory' in str(e):
+                            print('OOM in batch - skipping')
+                            torch.cuda.empty_cache()
+                            continue
+                        else:
+                            raise
+                else:
+                    break
+            
                 
-
-                #print the asr output of the val set to check on the progress of the model
-                #ASR PREDICTIONS
-                all_pred_asr = []
-                all_true_asr = []
-
-                asr_preds = torch.argmax(model_outputs['asr_output'], dim=-1).cpu().tolist()
-                asr_targets = asr_labels.cpu().tolist()
-
-                #convert ids to strings
-                for pred_ids, target_ids in zip(asr_preds, asr_targets):
-                    pred_tokens = tokenizer.batch_decode([pred_ids], skip_special_tokens=True)[0]
-                    target_tokens = tokenizer.batch_decode([target_ids], skip_special_tokens=True)[0]
-                    all_pred_asr.append(pred_tokens)
-                    all_true_asr.append(target_tokens)
-                
-                print('all true asr: ', all_true_asr)
-                print('all print asr: ', all_pred_asr)
-
-
-                # compute the loss 
-                computed_val_loss = (alpha_ctc*model_outputs['asr_loss']) + (alpha_prosody*model_outputs['prosody_loss']) + (alpha_ser*model_outputs['ser_loss'])
-                val_loss += computed_val_loss.item()
-
             # compute the average of the validation loss
             avg_val_loss = val_loss / len(val_loader)
 
@@ -664,11 +708,12 @@ def train(train_data, val_data, test_data, training_date, checkpoint_id, lstm_hi
 
         #unfreeze the model after some number of epochs
         '''
-        if epoch >= 1:
+        if epoch >= 3:
             if model_params_frozen == True:
                 xlsr_model.unfreeze_xlsr_model()
                 model_params_frozen = False
         '''
+
 
 
     
@@ -686,6 +731,9 @@ def train(train_data, val_data, test_data, training_date, checkpoint_id, lstm_hi
 
     return model_checkpoint_path, avg_collated_val_loss
 
+
+def train_with_hugging_face_trainer():
+    return
 
 #train(train_data, val_data, test_data, training_date, checkpoint_id, batch_size=1, epochs=50, lr=1e-4, alpha_ctc=1.0, alpha_ser=1.0, alpha_prosody=1.0)
 def objective(trial, train_data, val_data, test_data, training_date, checkpoint_id):
@@ -793,12 +841,12 @@ if __name__ == '__main__':
     #train the model
     #checkpoint_pth, avg_val_loss = train(train_data, val_data, test_data, cur_date, cur_exp_run, 192, batch_size=1, epochs=60, lr=1.747962919342474e-06, alpha_ctc=0.6, alpha_ser=0.1, alpha_prosody=0.6)
 
-    checkpoint_pth, avg_val_loss = train(train_data, val_data, test_data, cur_date, cur_exp_run, 192, batch_size=1, epochs=60, lr=1e-4, alpha_ctc=1.0, alpha_ser=0.0, alpha_prosody=0.0)
+    checkpoint_pth, avg_val_loss = train(train_data, val_data, test_data, cur_date, cur_exp_run, 192, batch_size=100, epochs=500, lr=3e-4, alpha_ctc=1.0, alpha_ser=0.0, alpha_prosody=0.0)
 
     #checkpoint_pth = "/home/dasa/ser_project/codebase/model_checkpoints/xlsr_multitask_model_17_05_1.pt"
 
     #MAX_PROSODY_LABELS_LEN = get_max_prosody_label_len(train_data, val_data, test_data)
     #test the model
-    test(checkpoint_pth, test_data, 1)
+    #test(checkpoint_pth, test_data, 1)
 
 
