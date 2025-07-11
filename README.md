@@ -2,6 +2,10 @@
 
 This repository contains a Multi-Task Learning (MTL) system for Speech Emotion Recognition (SER) that combines Automatic Speech Recognition (ASR), Prosody Analysis, and Emotion Recognition tasks. The system follows the methodology from "Speech Emotion Recognition with Multi-task Learning" paper.
 
+## Runpod deploy command
+
+`./deploy_runpod.sh 38.147.83.11 26195 mtl_ser`
+
 ## Features
 
 - **Multi-task learning architecture** with configurable backbone models

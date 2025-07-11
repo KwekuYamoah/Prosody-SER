@@ -181,20 +181,3 @@ class Wav2Vec2MTL(nn.Module):
                     "prosody_loss": prosody_loss,
                     "ser_loss": ser_loss
                 }
-
-
-
-
-
-
-
-        
-        
-
-
-
-
-
-
-
-
